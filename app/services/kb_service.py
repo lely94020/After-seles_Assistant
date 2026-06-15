@@ -77,12 +77,17 @@ class KbService:
     @staticmethod
     async def _save_to_disk(file: UploadFile) -> str:
         upload_dir = Path(settings.UPLOAD_DIR)
+        #如果不存在则递归创建
         upload_dir.mkdir(parents=True, exist_ok=True)
 
-        # re?
+        # re 是 Python 的标准库模块，代表正则表达式1。它提供了一套强大的工具，用于字符串的模式匹配、搜索、替换和解析等操作
+        #匹配不是字母、数字、下划线(\w)、连字符(-)和点号(.)的任何字符，并将其替换为下划线 _
+        #目的：防止路径遍历攻击。如果恶意用户上传的文件名为 ../../etc/passwd，经过此正则处理后，会变成 .._.._etc_passwd，从而避免了文件被写到预期目录之外的危险
         safe_name = re.sub(r"[^\w\-.]", "_", file.filename)
+        #使用/ 运算符拼接路径
         file_path = upload_dir / safe_name
 
+        # 如果目标路径已经存在同名文件，代码会自动在文件名后添加带括号的序号
         if file_path.exists():
             stem, suffix = file_path.stem, file_path.suffix
             counter = 1
@@ -103,8 +108,14 @@ class KbService:
 
     @staticmethod
     def _read_pdf(path: str) -> str:
+        #即 PyMuPDF
         import fitz
         doc = fitz.open(path)
+        """
+        使用生成器表达式遍历 PDF 的每一页（page），调用 get_text() 方法提取当前页的文本，
+        然后使用 "\n\n"（两个换行符）将所有页面的文本拼接成一个完整的字符串。
+        双换行符可以在不同页面之间保留明显的视觉分隔
+        """
         text = "\n\n".join(page.get_text() for page in doc)
         doc.close()
         return text
@@ -113,10 +124,19 @@ class KbService:
     def _read_docx(path: str) -> str:
         from docx import Document
         doc = Document(path)
+        """
+        使用列表推导式遍历文档的所有段落（doc.paragraphs），提取段落文本。
+        if p.text.strip() 的作用是过滤掉空段落或仅包含空白字符的段落。
+        """
         parts = [p.text for p in doc.paragraphs if p.text.strip()]
         for table in doc.tables:
+            """
+            对于每个表格，遍历其每一行（table.rows），再遍历每行中的每个单元格（row.cells），提取单元格文本并去除首尾空白。
+            然后使用 | 作为分隔符，将同一行的单元格文本拼接起来，形成一个类似 Markdown 表格格式的字符串
+            """
             rows = ["|".join(cell.text.strip() for cell in row.cells) for row in table.rows]
             parts.append("\n".join(rows))
+        #将 parts 列表中的所有段落文本和表格文本用两个换行符（\n\n）拼接，模拟文档中段落与段落、段落与表格之间的空行分隔效果
         return "\n\n".join(parts)
 
     # 结构感知分块
@@ -147,6 +167,10 @@ class KbService:
         current_title = ""
         current_body: list[str] = []
 
+        """
+        当遇到一个新的符合正则的标题行时，代码会先将之前缓存的正文拼接起来，
+        与旧标题组成元组存入 sections 列表；然后清空正文缓存，并更新当前标题为新标题
+        """
         for line in lines:
             if re.match(pattern, line.strip()):
                 if current_body:
@@ -181,6 +205,7 @@ class KbService:
             if KbService._is_table(para):
                 table_lines = [para]
                 i += 1
+                #继续检测后续段落，直到遇到非表格段落为止
                 while i < len(paragraphs) and KbService._is_table(paragraphs[i].strip()):
                     table_lines.append(paragraphs[i].strip())
                     i += 1
@@ -198,6 +223,7 @@ class KbService:
             if re.match(r"^\d+[.)、]\s", para):
                 step_lines = [para]
                 i += 1
+                #将连续的有序步骤段落合并拼接
                 while i < len(paragraphs):
                     nxt = paragraphs[i].strip()
                     if re.match(r"^\d+[.)、]\s", nxt):
