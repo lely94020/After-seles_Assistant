@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query
 
 from app.schemas.kb import DocumentResponse, DocumentDetailResponse
 from app.services.kb_service import KbService
@@ -16,6 +16,16 @@ async def upload(
 )->DocumentResponse:
     doc=await svc.upload(file,title,doc_type,product_model,product_series)
     return DocumentResponse.model_validate(doc)
+
+@router.get("/search")
+async def search_chunks(
+        q:str=Query(...,description="搜索关键词或问题"),
+        top_k:int=Query(5,ge=1,le=20),
+        svc:KbService=Depends()
+):
+    """语义搜索知识库"""
+    hits=await svc.search_chunks(q,top_k)
+    return {"query":q,"results":hits}
 
 @router.get("/{doc_id}",response_model=DocumentDetailResponse)
 async def get_document(doc_id:int,svc:KbService=Depends())->DocumentDetailResponse:

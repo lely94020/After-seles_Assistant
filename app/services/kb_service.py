@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.core.milvus_client import get_milvus_client, COLLECTION_NAME
 from app.database import get_db
 from app.models.kb import KbDocument, KbChunk
+from app.services.embedding_service import EmbeddingService
 
 MAX_TOKENS = 1000
 
@@ -57,16 +59,44 @@ class KbService:
         self.db.add(doc)
         await self.db.flush()
 
-        # ⑥ 保存分块
+        # ⑥ 保存分块到mysql
+        chunk_objects=[]
         for i, c in enumerate(chunks):
-            self.db.add(KbChunk(
+            chunk=KbChunk(
                 document_id=doc.id,
                 chunk_index=i,
                 content=c["content"],
                 chunk_type=c["type"],
                 parent_title=c.get("parent_title"),
                 token_count=c.get("token_count")
-            ))
+            )
+            self.db.add(chunk)
+            chunk_objects.append(chunk)
+
+        await self.db.flush()
+
+        # ⑦ 向量化 + 存入 Milvus
+        try:
+            texts=[chunk.content for chunk in chunk_objects]
+            embeddings=EmbeddingService.embed_batch(texts)
+
+            milvus=get_milvus_client()
+            milvus_data=[]
+            for chunk,emb in zip(chunk_objects,embeddings):
+                milvus_data.append({
+                    "id":chunk.id,# 用 MySQL 的 chunk id 作为 Milvus 主键
+                    "vector":emb,
+                    "chunk_id":chunk.id,
+                    "content":chunk.content,
+                    "content_type":chunk.chunk_type,
+                    "parent_title":chunk.parent_title or "",
+                    "document_id":doc.id
+                })
+                chunk.milvus_id=chunk.id
+
+            milvus.insert(collection_name=COLLECTION_NAME,data=milvus_data)
+        except Exception as e:
+            print(f"Milvus写入失败（向量搜索暂不可用）: {e}")
 
         doc.chunk_count = len(chunks)
         await self.db.flush()
@@ -315,3 +345,33 @@ class KbService:
             .limit(limit)
         )
         return list(r.scalars().all())
+
+    async def search_chunks(self,query:str,top_k:int=5)->list[dict]:
+        # ① 把用户问题转为向量
+        query_embedding=EmbeddingService.embed_single(query)
+
+        # ② 在 Milvus 中搜索
+        milvus=get_milvus_client()
+        results=milvus.search(
+            collection_name=COLLECTION_NAME,
+            data=[query_embedding],
+            limit=top_k,
+            output_fields=["content","chunk_type","parent_title","document_id"]
+        )
+
+        # ③ 整理返回结果
+        hits=[]
+        for hit in results[0]:
+            entity=hit.get("entity",{})
+            hits.append({
+                "chunk_id":hit["id"],
+                "content":entity.get("content",""),
+                "chunk_type":entity.get("chunk_type",""),
+                "parent_title":entity.get("parent_title",""),
+                "document_id":entity.get("document_id",0),
+                "score":hit["distance"]
+            })
+
+        return hits
+
+
