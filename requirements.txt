@@ -13,3 +13,5 @@ pymilvus>=2.3.0
 dashscope>=1.14.0
 asyncmy>=0.2.9
 greenlet>=3.0.0
+PyMuPDF>=1.23.0
+python-docx>=1.0.0
