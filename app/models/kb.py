@@ -24,6 +24,7 @@ class KbDocument(Base):
     )
     version: Mapped[int] = mapped_column(Integer, default=1)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    reference_count:Mapped[int]=mapped_column(Integer,default=0,server_default="0")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

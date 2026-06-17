@@ -1,14 +1,16 @@
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import select, update, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.core.milvus_client import get_milvus_client, COLLECTION_NAME
 from app.database import get_db
+from app.models.device import Device
 from app.models.kb import KbDocument, KbChunk
 from app.services.embedding_service import EmbeddingService
 
@@ -27,7 +29,14 @@ class KbService:
             doc_type: str,
             product_model: str | None = None,
             product_series: str | None = None,
+            replace_doc_id:int|None=None
     ) -> KbDocument:
+        #--- 增量更新时校验旧文档是否存在 ---
+        old_doc=None
+        if replace_doc_id is not None:
+            old_doc=await self.get_document(replace_doc_id)
+            if not old_doc:
+                raise HTTPException(status_code=404,detail="要替换的文档不存在")
         # ① 校验文件类型
         ext = Path(file.filename).suffix.lower()
         if ext not in self.ALLOWED_EXTENSIONS:
@@ -48,16 +57,19 @@ class KbService:
         # ④ 切块
         chunks = self._structure_aware_chunk(content)
 
-        # ⑤ 创建文档记录
-        doc = KbDocument(
-            title=title or file.filename,
-            doc_type=doc_type,
-            file_path=file_path,
-            product_model=product_model,
-            product_series=product_series
-        )
-        self.db.add(doc)
-        await self.db.flush()
+        # ⑤ 创建或复用文档记录
+        if old_doc:
+            doc=old_doc
+        else:
+            doc = KbDocument(
+                title=title or file.filename,
+                doc_type=doc_type,
+                file_path=file_path,
+                product_model=product_model,
+                product_series=product_series
+            )
+            self.db.add(doc)
+            await self.db.flush()
 
         # ⑥ 保存分块到mysql
         chunk_objects=[]
@@ -76,6 +88,7 @@ class KbService:
         await self.db.flush()
 
         # ⑦ 向量化 + 存入 Milvus
+        new_milvus_ids=[]
         try:
             texts=[chunk.content for chunk in chunk_objects]
             embeddings=EmbeddingService.embed_batch(texts)
@@ -84,21 +97,53 @@ class KbService:
             milvus_data=[]
             for chunk,emb in zip(chunk_objects,embeddings):
                 milvus_data.append({
-                    "id":chunk.id,# 用 MySQL 的 chunk id 作为 Milvus 主键
+                    "id":chunk.id,
                     "vector":emb,
                     "chunk_id":chunk.id,
-                    "content":chunk.content,
-                    "content_type":chunk.chunk_type,
-                    "parent_title":chunk.parent_title or "",
                     "document_id":doc.id
                 })
                 chunk.milvus_id=chunk.id
+                new_milvus_ids.append(chunk.id)
 
             milvus.insert(collection_name=COLLECTION_NAME,data=milvus_data)
+            milvus.flush()
         except Exception as e:
-            print(f"Milvus写入失败（向量搜索暂不可用）: {e}")
+            raise HTTPException(status_code=500,detail=f"Milvus写入失败：{e}")
+
+        # ⑧ 增量更新：验证新向量 → 删旧数据
+        if old_doc: #如果旧文档存在
+            #查询 Milvus 中是否已经存在与当前文档关联的新向量数据
+            verify=milvus.query(
+                collection_name=COLLECTION_NAME,
+                expr=f"document_id=={doc.id}",
+                limit=1
+            )
+            if not verify:
+                #如果查不到新数据，说明在执行这段代码之前，新向量的写入操作失败了。
+                # 此时需要执行回滚操作：删除可能部分写入的残缺新向量（new_milvus_ids）
+                milvus.delete(
+                    collection_name=COLLECTION_NAME,
+                    expr=f"id in {new_milvus_ids}"
+                )
+                raise HTTPException(status_code=500,detail="新向量写入失败，已回滚")
+            # 删除旧 chunk（MySQL + Milvus）
+            #TODO:存在事务一致性缺失，如果 MySQL 删除失败，Milvus 中的向量已经删除，
+            # 但 MySQL 中的记录还在，会导致脏数据（用户查不到向量，但数据库里还有记录）
+            old_ids=[c.id for c in old_doc.chunks]
+            if old_ids:
+                milvus.delete(
+                    collection_name=COLLECTION_NAME,
+                    expr=f"document_id=={doc.id} and id not in {new_milvus_ids}"
+                )
+                await self.db.execute(
+                    delete(KbChunk).where(KbChunk.id.in_(old_ids))
+                )
+            doc.file_path=file_path
+            doc.version=doc.version+1
+            doc.status="active"
 
         doc.chunk_count = len(chunks)
+        doc.updated_at=datetime.now()
         await self.db.flush()
         await self.db.refresh(doc)
         return doc
@@ -346,32 +391,149 @@ class KbService:
         )
         return list(r.scalars().all())
 
-    async def search_chunks(self,query:str,top_k:int=5)->list[dict]:
+    async def search_chunks(self, query: str, top_k: int = 5) -> list[dict]:
         # ① 把用户问题转为向量
-        query_embedding=EmbeddingService.embed_single(query)
+        query_embedding = EmbeddingService.embed_single(query)
 
-        # ② 在 Milvus 中搜索
-        milvus=get_milvus_client()
-        results=milvus.search(
+        # ② 在 Milvus 中搜索（只拿 chunk_id + document_id）
+        milvus = get_milvus_client()
+        results = milvus.search(
             collection_name=COLLECTION_NAME,
             data=[query_embedding],
-            limit=top_k,
-            output_fields=["content","chunk_type","parent_title","document_id"]
+            limit=top_k * 3,
+            output_fields=["chunk_id", "document_id"]
         )
 
-        # ③ 整理返回结果
-        hits=[]
+        # ③ 从 MySQL 查分块完整内容
+        chunk_ids = list({hit["id"] for hit in results[0]})
+        chunk_map = {}
+        if chunk_ids:
+            r = await self.db.execute(
+                select(KbChunk).where(KbChunk.id.in_(chunk_ids))
+            )
+            chunk_map = {c.id: c for c in r.scalars().all()}
+
+        # 收集所有 document_id，批量查状态
+        doc_ids = list({
+            hit.get("entity", {}).get("document_id", 0)
+            for hit in results[0]
+        })
+        doc_status_map = {}
+        if doc_ids:
+            r = await self.db.execute(
+                select(KbDocument.id, KbDocument.status).where(
+                    KbDocument.id.in_(doc_ids)
+                )
+            )
+            doc_status_map = {row[0]: row[1] for row in r.all()}
+
+        # 过滤 + 降权 + 填入内容
+        hits = []
         for hit in results[0]:
-            entity=hit.get("entity",{})
+            entity = hit.get("entity", {})
+            doc_id = entity.get("document_id", 0)
+            status = doc_status_map.get(doc_id, "active")
+
+            if status == "archived":
+                continue
+
+            chunk = chunk_map.get(hit["id"])
+            if not chunk:
+                continue
+
+            score = hit["distance"]
+            if status == "expired":
+                score *= 0.3
+
             hits.append({
-                "chunk_id":hit["id"],
-                "content":entity.get("content",""),
-                "chunk_type":entity.get("chunk_type",""),
-                "parent_title":entity.get("parent_title",""),
-                "document_id":entity.get("document_id",0),
-                "score":hit["distance"]
+                "chunk_id": hit["id"],
+                "content": chunk.content,
+                "chunk_type": chunk.chunk_type,
+                "parent_title": chunk.parent_title,
+                "document_id": doc_id,
+                "score": score
             })
 
-        return hits
+        # 重新按 score 排序，截取 top_k
+        hits.sort(key=lambda x: x["score"], reverse=True)
+        return hits[:top_k]
+
+    #生命周期管理
+    async def update_status(self,doc_id:int,new_status:str)->KbDocument:
+        allowed={"active","review_due","expired","archived"}
+        if new_status not in allowed:
+            raise HTTPException(status_code=400,detail=f"无效状态")
+
+        doc=await self.get_document(doc_id)
+        if not doc:
+            raise HTTPException(status_code=404,detail="文档不存在")
+        doc.status=new_status
+        await self.db.flush()
+        await self.db.refresh(doc)
+        return doc
+
+    async def renew_document(self,doc_id:int)->KbDocument:
+        doc=await self.get_document(doc_id)
+        if not doc:
+            raise HTTPException(status_code=404,detail="文档不存在")
+
+        doc.status="active"
+        doc.updated_at=datetime.now()
+        await self.db.flush()
+        await self.db.refresh(doc)
+        return doc
+
+    async def scan_expired(self)->dict:
+        """
+        每日定时扫描：
+        - active 超过 90 天未更新 → review_due
+        - expired 超过 180 天 → archived
+        """
+        now=datetime.now()
+        threshold_90d=now-timedelta(days=90)
+        threshold_180d=now-timedelta(days=180)
+
+        r1=await self.db.execute(
+            update(KbDocument)
+            .where(KbDocument.status=="active",KbDocument.updated_at<threshold_90d)
+            .values(status="review_due")
+        )
+        marked_review_due=r1.rowcount
+
+        r2=await self.db.execute(
+            update(KbDocument)
+            .where(KbDocument.status=="expired",KbDocument.updated_at<threshold_180d)
+            .values(status="archived")
+        )
+        archived_expired=r2.rowcount
+
+        await self.db.flush()
+        total=await self.db.scalar(select(func.count()).select_from(KbDocument))
+
+        return {
+            "scanned":total or 0,
+            "marked_review_due":marked_review_due,
+            "archived_expired":archived_expired
+        }
+
+    async def mark_by_device_status(self,model_number:str)->int:
+        """设备退市/固件更新时回调，关联该型号的 active 文档标记为 review_due"""
+        r=await self.db.execute(
+            update(KbDocument)
+            .where(KbDocument.product_model==model_number,KbDocument.status=="active")
+            .values(status="review_due")
+        )
+        await self.db.flush()
+        return r.rowcount
+
+    async def get_top_referenced(self,limit:int=10)->list[KbDocument]:
+        """高频引用统计"""
+        r=await self.db.execute(
+            select(KbDocument)
+            .order_by(KbDocument.reference_count.desc())
+            .limit(limit)
+        )
+        return list(r.scalars().all())
+
 
 
