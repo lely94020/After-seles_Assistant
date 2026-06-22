@@ -5,7 +5,7 @@ from sqlalchemy.orm import Mapped,mapped_column
 from app.database import Base
 
 class QAFeedback(Base):
-    __tablename__ = "qs_feedback"
+    __tablename__ = "qa_feedback"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     question: Mapped[str] = mapped_column(Text, nullable=False)

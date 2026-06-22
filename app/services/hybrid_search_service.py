@@ -9,11 +9,22 @@ from app.models.kb import KbDocument
 from app.services.embedding_service import EmbeddingService
 
 # 提取型号的正则（海康型号格式：字母开头+连字符+数字）
-_MODEL_PATTERN=re.compile(r"[A-Z]{2,}-[\w-]+")  #用于将正则表达式字符串编译成一个正则表达式对象
+_MODEL_PATTERN_STANDARD=re.compile(r"[A-Za-z]{2,}-[\w-]+")  #用于将正则表达式字符串编译成一个正则表达式对象
 
-def extract_model(text:str)->str|None:
-    m=_MODEL_PATTERN.search(text)
-    return m.group() if m else None
+# 宽松匹配：字母数字混合长度≥4的词（如 H100、7608N-K2、小米300）
+_MODEL_PATTERN_LOOSE = re.compile(r"\b[A-Za-z0-9\u4e00-\u9fff]{2,}?\d+[A-Za-z0-9\u4e00-\u9fff-]*\b")
+
+
+def extract_model(text: str) -> str | None:
+    # 优先标准格式
+    m = _MODEL_PATTERN_STANDARD.search(text)
+    if m:
+        return m.group()
+    # 宽松匹配兜底
+    m = _MODEL_PATTERN_LOOSE.search(text)
+    if m:
+        return m.group()
+    return None
 
 class HybridSearchService:
     def __init__(self,db:AsyncSession):
@@ -35,7 +46,15 @@ class HybridSearchService:
         #如果意图分类已给型号就用，否则从问题中自己提取
         if not model_number:
             model_number=extract_model(query)
-
+            # 非标准格式的型号去 Device 表校验，查不到就丢弃
+            if model_number and not _MODEL_PATTERN_STANDARD.match(model_number):
+                from sqlalchemy import select
+                from app.models.device import Device
+                r = await self.db.execute(
+                    select(Device.id).where(Device.model_number ==model_number)
+                )
+                if r.scalar_one_or_none() is None:
+                    model_number = None
         #向量检索
         query_embedding=EmbeddingService.embed_single(query)
         milvus=get_milvus_client()
@@ -43,7 +62,7 @@ class HybridSearchService:
             collection_name=COLLECTION_NAME,
             data=[query_embedding],
             limit=top_k,
-            output_fields=["chunk_id","content","document_id","parent_title"]
+            output_fields=["chunk_id","content","document_id","parent_title","product_series","doc_version"]
         )
 
         #关键词检索（MySQL LIKE + 型号精确匹配）

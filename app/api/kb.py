@@ -61,8 +61,7 @@ async def list_docs(skip:int=0,limit:int=20,svc:KbService=Depends()):
     docs=await svc.list_documents(skip,limit)
     return [DocumentResponse.model_validate(d) for d in docs]
 
-    # ========== 管理员：生命周期管理 ==========
-
+# ========== 管理员：生命周期管理 ==========
 
 @router.patch("/{doc_id}/status", response_model=DocumentResponse)
 async def update_status(

@@ -1,9 +1,32 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings
 from app.api import auth, chat, conversations, work_orders, kb
 
-app = FastAPI(title="Hikvision After-sales Smart Assistant", version="1.0.0")
+scheduler=AsyncIOScheduler()
+
+async def _daily_scan():
+    from app.database import async_session
+    from app.services.kb_service import KbService
+    async with async_session() as db:
+        svc=KbService(db)
+        result=await svc.scan_expired()
+        print(f"过期扫描完成:{result}")
+
+@asynccontextmanager    #用于将一个异步生成器函数转换成异步上下文管理器
+async def lifespan(app:FastAPI):
+    #向调度器添加一个定时任务，指定每天凌晨3点执行扫描任务
+    scheduler.add_job(_daily_scan,"cron",hour=3,minute=0)
+    scheduler.start()
+    yield   #整个生命周期的分水岭，yield之前执行启动前的初始化逻辑，之后执行关闭后的清理逻辑
+    scheduler.shutdown()
+app = FastAPI(
+    title="Hikvision After-sales Smart Assistant",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,6 +38,6 @@ app.add_middleware(
 
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["认证"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["对话"])
-# app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["对话管理"])
+app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["对话管理"])
 # app.include_router(work_orders.router, prefix="/api/v1/work_orders", tags=["工单"])
 app.include_router(kb.router, prefix="/api/v1/kb", tags=["知识库"])

@@ -76,34 +76,38 @@ class LLMService:
             query: str,
             retrieved_docs: list[dict],
     ) -> AsyncGenerator[str, None]:
-        """流式生成回答，逐token yield"""
-        #TODO:在 generate_stream 中，await Conversation.acall(...) 会一直阻塞，直到流式输出全部完成，
-        # 期间通过回调收集所有 chunks。这意味着它并没有真正实现逐 token 的实时流式推送。调用方必须等模型全部生成完，才能开始遍历 yield。
-        # 如果要实现真正的实时流式推送，应该使用 DashScope 提供的 async for 异步迭代器来逐块读取并 yield，而不是使用回调收集。
         prompt, refs = _build_prompt(query, retrieved_docs)
 
-        responses = []
+        queue: asyncio.Queue = asyncio.Queue()
 
         def callback(chunk):
-            responses.append(chunk)
+            if chunk.status_code == 200:
+                queue.put_nowait(chunk)
 
-        await asyncio.to_thread(
-            dashscope.Generation.call,
-            model=LLMService.MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            stream=True,
-            callback=callback,
-            api_key=settings.DASHSCOPE_API_KEY,
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                dashscope.Generation.call,
+                model=LLMService.MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=True,
+                callback=callback,
+                api_key=settings.DASHSCOPE_API_KEY,
+            )
         )
 
-        full_answer = ""
-        for r in responses:
-            if r.status_code == 200:
-                token = r.output.choices[0].message.content
-                full_answer += token
+        # 逐 token 实时推送
+        while not task.done() or not queue.empty():
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
+                token = chunk.output.choices[0].message.content
                 yield token
+            except asyncio.TimeoutError:
+                continue
 
+        await task  # 确保线程结束
+
+        # 最后推送引用信息
         yield json.dumps({"citations": refs}, ensure_ascii=False)

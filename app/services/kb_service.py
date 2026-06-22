@@ -100,7 +100,12 @@ class KbService:
                     "id":chunk.id,
                     "vector":emb,
                     "chunk_id":chunk.id,
-                    "document_id":doc.id
+                    "content":chunk.content,
+                    "content_type":chunk.chunk_type,
+                    "parent_title":chunk.parent_title or "",
+                    "document_id":doc.id,
+                    "product_series": doc.product_series or "",
+                    "doc_version": str(doc.version),
                 })
                 chunk.milvus_id=chunk.id
                 new_milvus_ids.append(chunk.id)
@@ -186,14 +191,27 @@ class KbService:
         #即 PyMuPDF
         import fitz
         doc = fitz.open(path)
-        """
-        使用生成器表达式遍历 PDF 的每一页（page），调用 get_text() 方法提取当前页的文本，
-        然后使用 "\n\n"（两个换行符）将所有页面的文本拼接成一个完整的字符串。
-        双换行符可以在不同页面之间保留明显的视觉分隔
-        """
-        text = "\n\n".join(page.get_text() for page in doc)
+        all_parts = []
+
+        for page in doc:
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                # type=0：文本块
+                if block["type"] == 0:
+                    text = " ".join(
+                        span["text"] for line in block["lines"]
+                        for span in line["spans"]
+                    ).strip()
+                    if len(text) < 5:
+                        continue
+                        #检测是否为表格行（按坐标判断：同一行有多个对齐的文本块）
+                    all_parts.append(text)
+                # type=1：图片块 → 跳过（不做 OCR），只记录占位
+                elif block["type"] == 1:
+                    all_parts.append("[图片]")
+
         doc.close()
-        return text
+        return "\n\n".join(all_parts)
 
     @staticmethod
     def _read_docx(path: str) -> str:

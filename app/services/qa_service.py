@@ -33,6 +33,12 @@ class QAService:
         # 模糊意图：直接返回追问
         if intent["primary_intent"] == "unclear":
             return self._clarify_response(question)
+        #保修/报修->查设备信息
+        if intent["primary_intent"]=="warranty_service":
+            return await self._handle_warranty(intent)
+        #SDK集成->限定SDK文档类型检索
+        if intent["primary_intent"]=="sdk_integration":
+            return await self._handle_sdk(intent,question)
 
         # 混合检索
         retrieved = await self.hybrid_search.search(
@@ -151,6 +157,101 @@ class QAService:
             "historical_resolve_rate":await self.get_historical_resolve_rate(intent.get("primary_intent", "")),
         }
 
+    async def _handle_warranty(self,intent:dict)->dict:
+        """保修查询：查 Device 表获取保修信息，并检索知识库中保修政策"""
+        model=intent.get("model_number")
+
+        # 从 Device 表查设备信息
+        from sqlalchemy import select
+        from app.models.device import Device
+        device_info = None
+        if model:
+            r = await self.db.execute(
+                select(Device).where(Device.model_number == model)
+            )
+            device_info = r.scalar_one_or_none()
+
+        # 同时检索知识库中的保修政策文档
+        retrieved = await self.hybrid_search.search(
+            query="保修政策 保修期限 售后服务",
+            model_number=model,
+            top_k=5,
+        )
+        _, citations = await LLMService.generate(
+            query=f"用户查询保修信息，型号={model or'未提供'}，请结合设备信息和检索到的保修政策回答",
+            retrieved_docs=retrieved,
+        )
+
+        answer_parts=[]
+        if device_info:
+            answer_parts.append(
+                f"## {device_info.product_name or model} 保修信息\n\n"
+                f"- **型号**：{device_info.model_number}\n"
+                f"- **保修期限**：{device_info.warranty_months} 个月\n"
+                f"- **产品状态**：{device_info.status}\n"
+            )
+        else:
+            answer_parts.append(
+                f"## 保修查询\n\n"
+                f"未查询到型号 {model} 的设备信息，请确认型号是否正确。\n" if model
+                else "请提供设备型号，以便查询保修信息。\n"
+            )
+
+        answer_parts.append(
+            "\n如需报修，请提供设备序列号（S/N 码），"
+            "或直接联系海康技术支持：400-800-5998。"
+        )
+
+        return {
+            "answer":"\n".join(answer_parts),
+            "confidence":0.9 if device_info else 0.3,
+            "disposition":"direct" if device_info else "refuse",
+            "intent":{"primary":"warranty_service","model_number":model},
+            "citations":citations,
+            "retrieval_count":len(retrieved),
+        }
+
+    async def _hand_sdk(self,intent:dict,question:str)->dict:
+        """SDK 集成：检索 SDK 相关文档库，回答 + 附代码示例引导"""
+        model = intent.get("model_number")
+
+        # 检索时强调 SDK 文档类型
+        retrieved = await self.hybrid_search.search(
+            query=question,
+            model_number=model,
+            top_k=10,
+        )
+
+        answer_text, citations = await LLMService.generate(
+            query=f"用户询问 SDK/API 集成问题：{question}。"
+                  f"请从检索到的 SDK 文档中给出技术回答，"
+                  f"如有代码示例请格式化展示，如无可跳过。",
+            retrieved_docs=retrieved,
+        )
+
+        business_context = await self._build_business_context(question,intent, retrieved)
+        confidence_result = await ConfidenceService.evaluate(
+            answer=answer_text,
+            retrieved_docs=retrieved,
+            business_context=business_context,
+            db=self.db,
+        )
+
+        final_answer = confidence_result["safe_answer"]
+        final_answer += (
+            "\n\n> 📦 如需完整的 SDK文档包，请访问海康开放平台下载最新版本。\n"
+            "> 如涉及特定型号的接口差异，建议参考该型号的开发手册。"
+        )
+
+        return {
+            "answer": final_answer,
+            "confidence": confidence_result["confidence"],
+            "disposition": confidence_result["disposition"],
+            "intent": {"primary": "sdk_integration", "model_number": model},
+            "citations": citations,
+            "retrieval_count": len(retrieved),
+        }
+
     def _clarify_response(self, question: str) -> dict:
             return {
                 "answer": "抱歉，我没有完全理解您的问题。请问您遇到的是：\n\n"
@@ -180,13 +281,14 @@ class QAService:
 
     async def get_historical_resolve_rate(self, intent_type: str) ->float:
         """查询同类意图的历史 AI 解决率"""
-        from sqlalchemy import func
+        from sqlalchemy import func,Integer,cast
         from app.models.qa_feedback import QAFeedback
 
         r = await self.db.execute(
             select(
                 func.count(),
-                func.sum(QAFeedback.resolved.cast(Integer))
+                #cast() 是在生成SQL时，告诉数据库把指定字段临时转成目标类型，用于解决查询时类型不匹配的问题。
+                func.sum(cast(QAFeedback.resolved,Integer))
             ).where(QAFeedback.intent == intent_type)
         )
         total, resolved = r.one()

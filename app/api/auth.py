@@ -16,7 +16,7 @@ security = HTTPBearer()
 async def login(req: LoginRequest, user_service: UserService = Depends()) -> TokenResponse:
     user = await user_service.authenticate(req.username, req.password)
     if not user:
-        raise HTTPException(status_code=400001, detail="用户名或密码错误")
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
     access_token = create_access_token(
         data={"sub": str(user.id), "type": user.user_type},
         expires_delta=timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
