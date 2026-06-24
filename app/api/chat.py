@@ -4,54 +4,67 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.schemas.chat import ChatRequest, ChatResponse, FeedbackRequest
+from app.schemas.chat import ChatRequest, FeedbackRequest
+from app.core.security import get_current_user_id
 from app.services.qa_service import QAService
 
 router = APIRouter()
 
-@router.post("",response_model=ChatResponse)
-async def chat(
-        body:ChatRequest,
-        db:AsyncSession=Depends(get_db)
-):
-    """智能问答（非流式）"""
-    svc=QAService(db)
-    result=await svc.answer(body.question)
-    return ChatResponse(
-        answer=result["answer"],
-        confidence=result["confidence"],
-        disposition=result["disposition"],
-        intent=result["intent"],
-        citations=result["citations"],
-    )
 
-@router.post("/stream")
-async def chat_stream(
-        body:ChatRequest,
-        db:AsyncSession=Depends(get_db)
+@router.post("")
+async def chat(
+    body: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
 ):
     """智能问答（SSE 流式）"""
     svc = QAService(db)
 
     async def event_generator():
-        async for event in svc.answer_stream(body.question):
+        full_answer = ""
+        done_event = None
+        async for event in svc.answer_stream(body.question, user_id=user_id):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if event.get("token") and not event.get("done"):
+                full_answer += event["token"]
+            if event.get("done"):
+                done_event = event
+
+        # 流式结束后持久化消息到对话
+        if body.conversation_id and full_answer:
+            from app.services.conversation_service import ConversationService
+            conv_svc = ConversationService(db)
+            await conv_svc.add_message(
+                conv_id=body.conversation_id,
+                role="user",
+                content=body.question,
+            )
+            await conv_svc.add_message(
+                conv_id=body.conversation_id,
+                role="assistant",
+                content=full_answer,
+                citations=done_event.get("citations") if done_event else None,
+                confidence=done_event.get("confidence") if done_event else None,
+                intent=done_event.get("intent", {}).get("primary") if done_event else None,
+            )
+        # 无论有无 conversation_id，都提交事务（answer_stream 内部可能已创建诊断会话）
+        await db.commit()
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # 禁用 nginx 缓冲
+            "X-Accel-Buffering": "no",
         },
     )
 
+
 @router.post("/feedback")
 async def feedback(
-        body: FeedbackRequest,
-        db: AsyncSession = Depends(get_db),
+    body: FeedbackRequest,
+    db: AsyncSession = Depends(get_db),
 ):
     svc = QAService(db)
-    await svc.record_feedback(body.question, body.intent,
-  body.resolved)
+    await svc.record_feedback(body.question, body.intent, body.resolved)
     return {"ok": True}

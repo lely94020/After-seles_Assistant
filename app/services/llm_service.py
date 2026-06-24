@@ -68,7 +68,7 @@ class LLMService:
         if resp.status_code != 200:
             raise RuntimeError(f"大模型调用失败：{resp.message}")
 
-        answer = resp.output.choices[0].message.content
+        answer = resp.output.text
         return answer, refs
 
     @staticmethod
@@ -80,34 +80,40 @@ class LLMService:
 
         queue: asyncio.Queue = asyncio.Queue()
 
-        def callback(chunk):
-            if chunk.status_code == 200:
-                queue.put_nowait(chunk)
-
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                dashscope.Generation.call,
-                model=LLMService.MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                stream=True,
-                callback=callback,
-                api_key=settings.DASHSCOPE_API_KEY,
-            )
-        )
-
-        # 逐 token 实时推送
-        while not task.done() or not queue.empty():
+        def _run():
             try:
-                chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
-                token = chunk.output.choices[0].message.content
-                yield token
-            except asyncio.TimeoutError:
-                continue
+                responses = dashscope.Generation.call(
+                    model=LLMService.MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    stream=True,
+                    incremental_output=True,
+                    api_key=settings.DASHSCOPE_API_KEY,
+                )
+                for chunk in responses:
+                    if chunk.status_code == 200 and chunk.output and chunk.output.text:
+                        queue.put_nowait(("token", chunk.output.text))
+                queue.put_nowait(("done", None))
+            except Exception as e:
+                queue.put_nowait(("error", str(e)))
 
-        await task  # 确保线程结束
+        task = asyncio.create_task(asyncio.to_thread(_run))
+
+        while True:
+            try:
+                msg_type, payload = await asyncio.wait_for(queue.get(), timeout=30.0)
+                if msg_type == "done":
+                    break
+                elif msg_type == "error":
+                    raise RuntimeError(payload)
+                elif msg_type == "token":
+                    yield payload
+            except asyncio.TimeoutError:
+                raise RuntimeError("大模型调用超时")
+
+        await task
 
         # 最后推送引用信息
         yield json.dumps({"citations": refs}, ensure_ascii=False)

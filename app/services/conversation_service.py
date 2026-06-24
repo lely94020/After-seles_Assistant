@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime,timedelta
-from sqlalchemy import select,update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -101,18 +101,64 @@ class ConversationService:
         )
         redis=await get_redis()
         await redis.delete(f"session:{conv_id}")
+        await self._cleanup_checkpoint(redis, conv_id)
+
+    #----删除对话----
+
+    async def delete(self, conv_id: int) -> None:
+        """硬删除对话：清理 Redis 会话 + checkpoint，删除 MySQL 中的对话和关联消息"""
+        redis = await get_redis()
+        await redis.delete(f"session:{conv_id}")
+        await self._cleanup_checkpoint(redis, conv_id)
+
+        # 先删消息（外键约束），再删对话
+        await self.db.execute(
+            delete(Message).where(Message.conversation_id == conv_id)
+        )
+        await self.db.execute(
+            delete(Conversation).where(Conversation.id == conv_id)
+        )
+        await self.db.flush()
 
     #----会话超时扫描----
     async def scan_timeout_sessions(self)->int:
-        """扫描超过30分钟无活动的active会话，标记为timeout"""
+        """扫描超过30分钟无活动的active会话，标记为timeout并清理Redis checkpoint"""
         threshold=datetime.now()-timedelta(minutes=30)
+
+        # 先查出超时会话的ID
         r=await self.db.execute(
-            update(Conversation)
+            select(Conversation.id)
             .where(
                 Conversation.status=="active",
                 Conversation.updated_at<threshold,
             )
+        )
+        timeout_ids=[row[0]for row in r.all()]
+        if not timeout_ids:
+            return 0
+
+        # 清理每个会话的 Redis checkpoint + session key
+        redis=await get_redis()
+        for conv_id in timeout_ids:
+            await redis.delete(f"session:{conv_id}")
+            await self._cleanup_checkpoint(redis, conv_id)
+
+        # 批量更新 MySQL 状态
+        await self.db.execute(
+            update(Conversation)
+            .where(Conversation.id.in_(timeout_ids))
             .values(status="timeout",closed_at=datetime.now())
         )
         await self.db.flush()
-        return r.rowcount
+        logger.info(f"超时清理：{len(timeout_ids)} 个会话已关闭，Redis checkpoint 已删除")
+        return len(timeout_ids)
+
+    @staticmethod
+    async def _cleanup_checkpoint(redis,conv_id:int)->None:
+        """删除 LangGraph AsyncRedisSaver 的 checkpoint 和 checkpoint_write 键"""
+        thread_id=str(conv_id)
+        # AsyncRedisSaver 键格式：checkpoint:{thread_id}:... 和 checkpoint_write:{thread_id}:...
+        for prefix in ("checkpoint","checkpoint_write"):
+            pattern=f"{prefix}:{thread_id}:*"
+            async for key in redis.scan_iter(match=pattern,count=100):
+                await redis.delete(key)

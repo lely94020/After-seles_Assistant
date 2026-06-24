@@ -27,5 +27,4 @@ class ConversationDetailResponse(ConversationResponse):
     messages:list[MessageResponse]=[]
 
 class ChatWithContextRequest(BaseModel):
-    conversation_id:int
     question:str

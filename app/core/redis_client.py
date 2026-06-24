@@ -8,7 +8,7 @@ async def get_redis()->aioredis.Redis:
     if _pool is None:
         _pool=aioredis.ConnectionPool.from_url(
             settings.REDIS_URL,
-            max_connection=10,
+            max_connections=10,
             decode_responses=True,
         )
     return aioredis.Redis(connection_pool=_pool)

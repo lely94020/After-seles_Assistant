@@ -3,12 +3,12 @@ from typing import Literal
 
 import dashscope
 from langgraph.graph import StateGraph,END
-from langgraph.checkpoint.redis import RedisSaver
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from typing import TypedDict,Annotated
 import operator
 
-from app.core.redis_client import get_redis
 from app.config import settings
+import redis.asyncio as aioredis
 
 logger=logging.getLogger(__name__)
 
@@ -52,19 +52,28 @@ def _format_key_facts(state:DiagnosisState)->str:
     return "\n".join(lines) if lines else "暂无"
 
 async def intent_classify_node(state:DiagnosisState)->dict:
-    """节点1:意图分类+问题分类（复用IntentService）"""
-    from app.services.intent_service import IntentService
-    #从 state 的 messages 列表中取出最后一条消息的 content 作为用户的当前输入 user_msg
-    user_msg=state["messages"][-1]["content"] if state["messages"]else""
+    """节点1:意图分类+问题分类（复用IntentService）。已有key_facts则跳过LLM调用"""
+    kf=state.get("key_facts",{})
 
+    #已有symptom说明已经分类过，跳过LLM调用
+    if kf.get("symptom"):
+        kf.setdefault("checked",[])
+        kf.setdefault("ruled_out",[])
+        return {
+            "key_facts":kf,
+            "current_step":"intent_classify",
+            "step_index":state.get("step_index",0),
+            "resolved":False,
+        }
+
+    from app.services.intent_service import IntentService
+    user_msg=state["messages"][-1]["content"] if state["messages"]else""
     result=await IntentService.classify(user_msg)
 
-    #初始化key_facts
-    kf=state.get("key_facts",{})
     if result.get("model_number"):
         kf["device_model"]=result["model_number"]
     kf["symptom"]=user_msg
-    kf.setdefault("checked",[]) #确保列表存在，若不存在则初始化为空列表
+    kf.setdefault("checked",[])
     kf.setdefault("ruled_out",[])
 
     return {
@@ -75,7 +84,16 @@ async def intent_classify_node(state:DiagnosisState)->dict:
     }
 
 async def generate_plan_node(state:DiagnosisState)->dict:
-    """节点2:根据key_facts生成排查计划"""
+    """节点2:根据key_facts生成排查计划（已有计划则跳过LLM调用）"""
+    # 如果已有排查计划（从 checkpoint 恢复时），直接使用，不重复调用 LLM
+    existing_plan=state.get("diagnosis_plan",[])
+    if existing_plan:
+        return {
+            "diagnosis_plan":existing_plan,
+            "step_index":state.get("step_index",0),
+            "current_step":"generate_plan",
+        }
+
     kf=state.get("key_facts",{})
     symptom=kf.get("symptom","")
 
@@ -99,7 +117,7 @@ async def generate_plan_node(state:DiagnosisState)->dict:
         api_key=settings.DASHSCOPE_API_KEY,
     )
 
-    raw=resp.output.choices[0].message.content if resp.status_code==200 else ""
+    raw = resp.output.text if resp.status_code == 200 and resp.output else ""
     #解析步骤
     import re
     steps=re.findall(r"\d+\.\s*(.+)",raw)   # 匹配出带编号的步骤内容
@@ -157,9 +175,15 @@ async def process_feedback_node(state:DiagnosisState)->dict:
         "update_key_facts":{{"key":"value"}},
         "append_checked":["已确认的事实"],
         "append_ruled_out":["已排除的可能"],
-        "is_resolved":False,
-        "resolution":""
+        "is_resolved":true或false,
+        "resolution":"问题原因总结（若已解决）"
     }}
+
+    is_resolved 判断规则：
+    - 用户明确表示问题已解决（如"解决了"、"正常了"、"搞定了"、"可以了"）→ true
+    - 用户反馈表明根因已找到且可自行处理（如"红外灯坏了，我去换一个"）→ true
+    - 用户仍在描述新现象、继续排查、表示还未验证 → false
+    - 无法确定 → false
 """
     import asyncio,json
     resp=await asyncio.to_thread(
@@ -170,7 +194,7 @@ async def process_feedback_node(state:DiagnosisState)->dict:
     )
 
     try:
-        raw=resp.output.choices[0].message.content
+        raw = resp.output.text if resp.status_code == 200 and resp.output else ""
         parsed=json.loads(raw)if raw else {}
     except json.JSONDecodeError:
         parsed={}
@@ -178,6 +202,8 @@ async def process_feedback_node(state:DiagnosisState)->dict:
     #更新key_facts
     if parsed.get("update_key_facts"):
         kf.update(parsed["update_key_facts"])
+    if parsed.get("resolution"):
+        kf["resolution"]=parsed["resolution"]
     checked=kf.get("checked",[])
 
     if parsed.get("append_checked"):
@@ -188,10 +214,13 @@ async def process_feedback_node(state:DiagnosisState)->dict:
     kf["checked"]=checked
     kf["ruled_out"]=ruled_out
 
+    next_idx = state.get("step_index", 0) + 1
+
     return {
-        "key_facts":kf,
-        "resolved":parsed.get("is_resolved",False),
-        "current_step":"process_feedback"
+        "key_facts": kf,
+        "resolved": parsed.get("is_resolved", False),
+        "current_step": "process_feedback",
+        "step_index": next_idx,
     }
 
 def route_after_feedback(state:DiagnosisState)->Literal["continue","resolve","escalate"]:
@@ -202,22 +231,31 @@ def route_after_feedback(state:DiagnosisState)->Literal["continue","resolve","es
     plan=state.get("diagnosis_plan",[])
     idx=state.get("step_index",0)
 
-    if idx+1>len(plan):
+    if idx >= len(plan):
         return "escalate"   #所有步骤执行完还没解决->转人工
 
     return "continue"
 
 async def resolve_node(state:DiagnosisState)->dict:
     """节点5:给出最终解决方案"""
+    kf=state.get("key_facts",{})
+    resolution=kf.get("resolution","问题已定位")
+    checked=kf.get("checked",[])
+    ruled_out=kf.get("ruled_out",[])
+
+    summary_parts=[f"## 诊断完成\n\n**结论**：{resolution}\n"]
+    if checked:
+        summary_parts.append("### 已排查项\n" + "\n".join(f"- {c}" for c in checked) + "\n")
+    if ruled_out:
+        summary_parts.append("### 已排除原因\n" + "\n".join(f"- {r}" for r in ruled_out) + "\n")
+    summary_parts.append("如有后续问题，欢迎随时咨询。")
+
     return {
         "current_step":"resolve",
         "resolved":True,
         "messages":[{
             "role":"assistant",
-            "content":"##诊断完成\n\n"
-            "根据排查过程，问题已定位。以下是完整的诊断结论和建议方案。\n\n"
-            f"##关键发现\n{_format_key_facts(state)}\n\n"
-            "如有后续问题，欢迎随时咨询。"
+            "content":"\n".join(summary_parts)
         }],
     }
 
@@ -238,10 +276,10 @@ async def escalate_node(state:DiagnosisState)->dict:
 #-------构建Graph----------
 async def build_diagnosis_graph():
     """构建并返回编译后的诊断图(带Redis checkpoint)"""
-    redis_client=await get_redis()
-
-    #创建RedisSaver用于checkpoint持久化
-    saver=RedisSaver(redis_client)
+    # AsyncRedisSaver 需要 redis.asyncio.Redis 客户端
+    async_redis = aioredis.Redis.from_url(settings.REDIS_URL)
+    saver = AsyncRedisSaver(redis_client=async_redis)
+    await saver.setup()  # 创建 Redis Search 索引（checkpoint / checkpoint_write）
 
     graph=StateGraph(DiagnosisState)
     graph.add_node("intent_classify", intent_classify_node) #意图分类，识别用户输入的核心意图
@@ -267,4 +305,7 @@ async def build_diagnosis_graph():
     graph.add_edge("resolve",END)
     graph.add_edge("escalate",END)
 
-    return graph.compile(checkpointer=saver)
+    return graph.compile(
+        checkpointer=saver,
+        interrupt_before=["process_feedback"],  # ask_step 之后停下来等用户回复
+    )

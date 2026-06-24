@@ -36,89 +36,93 @@ class DiagnosisService:
         #获取会话
         conv=await self.conv_svc.get(conversation_id)
         if not conv:
-            # 首次对话：先创建会话，复用现有 QA 流水线出第一轮回答
             return await self._first_turn(conversation_id,user_input,user_id)
 
         #保存用户消息
         await self.conv_svc.add_message(conv.id,"user",user_input)
 
-        #运行LangGraph
+        #从 MySQL 加载诊断状态
+        key_facts=conv.key_facts or {}
+        step_index=conv.step_index or 0
+        diagnosis_plan=key_facts.get("_diagnosis_plan",[])
+
         graph=await _get_graph()
         config={"configurable":{"thread_id":str(conv.id)}}
 
-        state_before=await graph.aget_state(config)     #？
-        current_node=state_before.values.get("current_step","")if state_before.values else ""
+        # 检查是否有 checkpoint：有则更新状态后从中断点恢复，无则传完整历史从头跑
+        state_before=await graph.aget_state(config)
+        if state_before:
+            # aupdate_state 追加本轮用户消息 → ainvoke(None) 从中断点恢复执行 process_feedback
+            await graph.aupdate_state(
+                config,
+                {"messages":[{"role":"user","content":user_input}]}
+            )
+            result=await graph.ainvoke(None, config)
+        else:
+            input_messages=[{"role":m.role,"content":m.content} for m in (conv.messages or [])]
+            result=await graph.ainvoke(
+                {"messages":input_messages,"key_facts":key_facts,
+                 "diagnosis_plan":diagnosis_plan,"step_index":step_index,
+                 "current_step":"intent_classify","resolved":False},
+                config
+            )
 
-        #构建输入消息(将对话历史注入state.messages)
-        messages_history=[
-            {"role":m.role,"content":m.content}for m in (conv.messages or [])
-        ]
-
-        input_state={
-            "messages": messages_history,
-            "key_facts": conv.key_facts or {},
-            "current_step": conv.status or current_node,
-            "diagnosis_plan": state_before.values.get("diagnosis_plan", []) if
-            state_before.values else [],
-            "step_index": conv.step_index or 0,
-            "resolved": False,
-        }
-
-        #执行图
-        result=await graph.ainvoke(input_state,config)
-
-        #同步状态回MYSQL
-        await self.conv_svc.update_key_facts(conv.id,result.get("key_facts",{}))
+        #同步状态回MySQL
+        kf=result.get("key_facts",{})
+        kf["_diagnosis_plan"]=result.get("diagnosis_plan",[])
+        await self.conv_svc.update_key_facts(conv.id,kf)
         await self.conv_svc.update_step(conv.id,result.get("step_index",0))
 
-        #拿最后一条assistant消息返回给用户
+        current_node=result.get("current_step","")
+
+        #提取本轮新增的 assistant 消息（排除 checkpoint 中已有的历史消息）
+        skip_count=len(state_before.values.get("messages",[])) + 1 if state_before else 0
         last_assistant_msg=""
-        for msg in reversed(result.get("messages", [])):
-            if msg.get("role") == "assistant" or msg.get("role") == "system":
-                last_assistant_msg = msg["content"]
+        for msg in reversed(result.get("messages",[])[skip_count:]):
+            if msg.get("role")=="assistant":
+                last_assistant_msg=msg["content"]
                 break
 
         if not last_assistant_msg:
-            #如果state中没有assistant回复，说明需要生成引导问题
             last_assistant_msg=self._build_guidance_message(result)
 
-        #保存 assistant 消息
-        await self.conv_svc.add_message(conv.id, "assistant",last_assistant_msg)
+        #保存assistant消息
+        await self.conv_svc.add_message(conv.id,"assistant",last_assistant_msg)
 
-        #  判断是否结束
+        #判断是否结束
         if result.get("resolved"):
-            await self.conv_svc.close(conv.id, "resolved")
-        elif result.get("current_step") == "escalate":
-            await self.conv_svc.close(conv.id, "escalated")
+            await self.conv_svc.close(conv.id,"resolved")
+        elif result.get("current_step")=="escalate":
+            await self.conv_svc.close(conv.id,"escalated")
 
         return {
-            "conversation_id": conv.id,
-            "answer": last_assistant_msg,
-            "status": conv.status,
-            "step_index": result.get("step_index", 0),
-            "total_steps": len(result.get("diagnosis_plan", [])),
-            "key_facts": result.get("key_facts", {}),
+            "conversation_id":conv.id,
+            "answer":last_assistant_msg,
+            "status":conv.status,
+            "step_index":result.get("step_index",0),
+            "total_steps":len(result.get("diagnosis_plan",[])),
+            "key_facts":result.get("key_facts",{}),
         }
 
     async def _first_turn(self,conversation_id:int,user_input:str,user_id)->dict:
         """首次对话：用QA引擎出第一轮回答，同时初始化LangGraph state"""
 
         # 先用 QA 引擎生成初始回答
-        qa_result=await self.qa_svc.answer(user_input)      #结果包含回答内容、意图、置信度等
+        qa_result=await self.qa_svc.answer(user_input)
 
         # 创建会话
         conv = await self.conv_svc.create(
             user_id=user_id,
-            title=user_input[:50],      #使用用户输入的前50字作为会话标题
+            title=user_input[:50],
         )
 
         # 保存用户消息
         await self.conv_svc.add_message(conv.id, "user", user_input)
 
-        # 如果意图是故障诊断，初始化 LangGraph state
+        # 如果意图是故障诊断，初始化 LangGraph state 并生成排查计划
         if qa_result["intent"]["primary"] == "fault_diagnosis":
             graph = await _get_graph()
-            config = {"configurable": {"thread_id": str(conv.id)}}      #配置线程ID绑定当前会话ID
+            config = {"configurable": {"thread_id": str(conv.id)}}
 
             input_state = {
                 "messages": [
@@ -137,10 +141,14 @@ class DiagnosisService:
                 "resolved": False,
             }
 
-            result = await graph.ainvoke(input_state, config)   #生成诊断计划
-            await self.conv_svc.update_key_facts(conv.id,result.get("key_facts", {}))
+            result = await graph.ainvoke(input_state, config)
 
-            # 保存 assistant 回答
+            # 将 diagnosis_plan 持久化到 key_facts
+            kf = result.get("key_facts", {})
+            kf["_diagnosis_plan"] = result.get("diagnosis_plan", [])
+            await self.conv_svc.update_key_facts(conv.id, kf)
+
+        # 保存 assistant 回答
         await self.conv_svc.add_message(
             conv.id, "assistant", qa_result["answer"],
             citations=qa_result.get("citations", []),

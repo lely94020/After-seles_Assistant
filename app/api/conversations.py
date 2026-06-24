@@ -1,4 +1,6 @@
+import json
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -52,10 +54,22 @@ async def chat_with_context(
         user_id:int=Depends(get_current_user_id),
         db: AsyncSession = Depends(get_db),
 ):
-    """在多轮对话上下文中发送消息（诊断流程）"""
+    """在多轮对话上下文中发送消息（诊断流程，SSE 流式）"""
     diag_svc = DiagnosisService(db)
-    result = await diag_svc.run_diagnosis_step(conv_id, body.question,user_id)
-    return result
+
+    async def event_generator():
+        result = await diag_svc.run_diagnosis_step(conv_id, body.question, user_id)
+        # 以 SSE 格式推送诊断结果
+        yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/{conv_id}/close")
@@ -65,4 +79,15 @@ async def close_conversation(
 ):
     svc = ConversationService(db)
     await svc.close(conv_id, "resolved")
+    return {"ok": True}
+
+
+@router.delete("/{conv_id}")
+async def delete_conversation(
+        conv_id: int,
+        db: AsyncSession = Depends(get_db),
+):
+    svc = ConversationService(db)
+    await svc.delete(conv_id)
+    await db.commit()
     return {"ok": True}
