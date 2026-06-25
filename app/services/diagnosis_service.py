@@ -94,6 +94,8 @@ class DiagnosisService:
             await self.conv_svc.close(conv.id,"resolved")
         elif result.get("current_step")=="escalate":
             await self.conv_svc.close(conv.id,"escalated")
+            # 自动从对话创建工单
+            await self._auto_create_work_order(conv.id, user_id, result)
 
         return {
             "conversation_id":conv.id,
@@ -102,6 +104,7 @@ class DiagnosisService:
             "step_index":result.get("step_index",0),
             "total_steps":len(result.get("diagnosis_plan",[])),
             "key_facts":result.get("key_facts",{}),
+            "work_order_created": result.get("current_step")=="escalate",
         }
 
     async def _first_turn(self,conversation_id:int,user_input:str,user_id)->dict:
@@ -169,3 +172,26 @@ class DiagnosisService:
         if idx < len(plan):
             return f"### 排查第 {idx + 1}步\n\n{plan[idx]}\n\n请告诉我检查结果。"
         return "诊断已完成，请确认问题是否解决。"
+
+    async def _auto_create_work_order(self, conversation_id: int, user_id: int, graph_state: dict) -> None:
+        """诊断升级时自动创建工单"""
+        from app.services.work_order_service import WorkOrderService
+        try:
+            wo_svc = WorkOrderService(self.db)
+            order, missing, followup = await wo_svc.create_from_conversation(conversation_id, user_id)
+            if order:
+                logger.info(f"诊断升级自动创建工单: {order.order_number}")
+            else:
+                # 信息不完整时，用 key_facts 中已有信息直接创建
+                kf = graph_state.get("key_facts", {})
+                order = await wo_svc.create(
+                    user_id=user_id,
+                    order_type="fault_repair",
+                    fault_description=kf.get("symptom") or kf.get("resolution", "诊断未解决，需人工处理"),
+                    serial_number=kf.get("serial_number"),
+                    contact_info=kf.get("contact_info"),
+                    conversation_id=conversation_id,
+                )
+                logger.info(f"诊断升级创建不完整工单: {order.order_number}，缺失字段: {missing}")
+        except Exception as e:
+            logger.error(f"自动创建工单失败: {e}")

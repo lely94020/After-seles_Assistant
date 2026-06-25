@@ -88,8 +88,17 @@ class QAService:
             "retrieval_count": len(retrieved),
         }
 
-    async def answer_stream(self, question: str, user_id: int | None = None):
+    async def answer_stream(self, question: str, user_id: int | None = None, conversation_id: int | None = None):
             """流式问答：先完成检索，再流式输出生成结果"""
+
+            # 保修对话的后续消息：收集工单信息 → 创建工单
+            if conversation_id:
+                conv_svc = ConversationService(self.db)
+                conv = await conv_svc.get(conversation_id)
+                if conv and conv.key_facts and conv.key_facts.get("_intent") == "warranty_service":
+                    async for event in self._handle_warranty_followup(conv, question, user_id):
+                        yield event
+                    return
 
             # ① 意图分类
             intent = await IntentService.classify(question)
@@ -102,9 +111,9 @@ class QAService:
                        "citations": [], "intent": {"primary": "unclear"}}
                 return
 
-            # 保修/报修 → 查设备信息 + 流式回答
+            # 保修/报修 → 查设备信息 + 流式回答 + 创建保修对话
             if intent["primary_intent"] == "warranty_service":
-                async for event in self._handle_warranty_stream(intent):
+                async for event in self._handle_warranty_stream(intent, user_id, question):
                     yield event
                 return
 
@@ -368,8 +377,8 @@ class QAService:
             "retrieval_count": len(retrieved),
         }
 
-    async def _handle_warranty_stream(self, intent: dict):
-        """保修查询流式版：先推设备信息，再流式生成保修说明"""
+    async def _handle_warranty_stream(self, intent: dict, user_id: int | None = None, question: str = ""):
+        """保修查询流式版：查设备信息 + 回答 + 创建保修对话 + 追问工单信息"""
         model = intent.get("model_number")
 
         from sqlalchemy import select
@@ -418,15 +427,7 @@ class QAService:
                 all_tokens += chunk
                 yield {"token": chunk, "done": False}
 
-        # 结尾
-        footer = (
-            "\n\n如需报修，请提供设备序列号（S/N 码），"
-            "或直接联系海康技术支持：400-800-5998。"
-        )
-        all_tokens += footer
-        yield {"token": footer, "done": False}
-
-        # 置信度评估（幻觉控制）
+        # 置信度评估
         business_context = await self._build_business_context(
             f"保修查询 {model}", intent, retrieved
         )
@@ -437,7 +438,48 @@ class QAService:
             db=self.db,
         )
 
-        yield {
+        # 创建保修对话，追问缺失信息
+        conversation_id = None
+        if user_id:
+            conv_svc = ConversationService(self.db)
+            conv = await conv_svc.create(
+                user_id=user_id,
+                title=f"保修/报修 - {model or '未知型号'}",
+            )
+            conversation_id = conv.id
+
+            # 从初始问题提取字段并保存
+            from app.services.work_order_service import WorkOrderService
+            wo_svc = WorkOrderService(self.db)
+            initial_fields = await wo_svc.extract_from_message(question)
+            if model and not initial_fields.get("device_model"):
+                initial_fields["device_model"] = model
+
+            await conv_svc.update_key_facts(conv.id, {
+                "_intent": "warranty_service",
+                "device_model": model,
+                "_extracted_fields": initial_fields,
+            })
+
+            await conv_svc.add_message(conv.id, "user", question)
+            await conv_svc.add_message(
+                conv.id, "assistant", all_tokens,
+                citations=citations,
+                intent="warranty_service",
+            )
+
+            # 追问缺失的工单信息
+            followup = (
+                "\n\n---\n> 📋 如需为您创建报修工单，请补充以下信息：\n"
+                "> 1. 设备序列号（S/N 码）\n"
+                "> 2. 故障现象描述\n"
+                "> 3. 您的联系方式\n"
+                ">\n> 请一次性提供，我会自动为您生成工单。"
+            )
+            all_tokens += followup
+            yield {"token": followup, "done": False}
+
+        done_event = {
             "token": "",
             "done": True,
             "confidence": confidence_result["confidence"],
@@ -445,6 +487,96 @@ class QAService:
             "citations": citations,
             "intent": {"primary": "warranty_service", "model_number": model},
         }
+        if conversation_id:
+            done_event["conversation_id"] = conversation_id
+        yield done_event
+
+    async def _handle_warranty_followup(self, conv, question: str, user_id: int | None = None):
+        """保修对话后续：增量提取工单信息 → 校验 → 创建工单或继续追问"""
+        from app.services.work_order_service import WorkOrderService
+        from app.schemas.work_order import WorkOrderResponse
+
+        conv_svc = ConversationService(self.db)
+        await conv_svc.add_message(conv.id, "user", question)
+
+        wo_svc = WorkOrderService(self.db)
+
+        # 从最新消息中增量提取（只提取新信息）
+        new_fields = await wo_svc.extract_from_message(question)
+
+        # 与已有字段合并，不覆盖已有值
+        kf = conv.key_facts or {}
+        extracted = kf.get("_extracted_fields", {})
+        for k, v in new_fields.items():
+            if v and not extracted.get(k):
+                extracted[k] = v
+        # 设备型号也合并
+        if kf.get("device_model") and not extracted.get("device_model"):
+            extracted["device_model"] = kf["device_model"]
+
+        # 保存提取结果到 key_facts
+        kf["_extracted_fields"] = extracted
+        await conv_svc.update_key_facts(conv.id, kf)
+
+        order_type = extracted.get("order_type", "fault_repair")
+        missing = wo_svc.check_completeness(extracted, order_type)
+
+        if missing:
+            # 信息不完整，继续追问
+            followup = wo_svc.generate_followup_question(missing)
+            await conv_svc.add_message(conv.id, "assistant", followup, intent="warranty_service")
+
+            yield {"token": followup, "done": False}
+            yield {
+                "token": "",
+                "done": True,
+                "confidence": 0.8,
+                "disposition": "direct",
+                "citations": [],
+                "intent": {"primary": "warranty_service"},
+                "conversation_id": conv.id,
+            }
+        else:
+            # 信息完整，创建工单
+            order = await wo_svc.create(
+                user_id=user_id or conv.user_id,
+                order_type=order_type,
+                fault_description=extracted.get("fault_description"),
+                serial_number=extracted.get("serial_number"),
+                contact_info=extracted.get("contact_info"),
+                device_model=extracted.get("device_model"),
+                conversation_id=conv.id,
+            )
+            await self.db.commit()
+
+            # 重新加载工单（含 notes 关联），避免异步懒加载报错
+            order = await wo_svc.get(order.id)
+
+            answer = (
+                f"工单已自动创建！\n\n"
+                f"- **工单号**：{order.order_number}\n"
+                f"- **类型**：{order_type}\n"
+                f"- **设备型号**：{extracted.get('device_model', '-')}\n"
+                f"- **序列号**：{extracted.get('serial_number', '-')}\n"
+                f"- **故障描述**：{extracted.get('fault_description', '-')}\n\n"
+                f"售后人员将尽快与您联系，请保持电话畅通。"
+            )
+            await conv_svc.add_message(conv.id, "assistant", answer, intent="warranty_service")
+
+            yield {"token": answer, "done": False}
+            yield {
+                "token": "",
+                "done": True,
+                "confidence": 0.95,
+                "disposition": "direct",
+                "citations": [],
+                "intent": {"primary": "warranty_service"},
+                "conversation_id": conv.id,
+                "work_order": {
+                    "created": True,
+                    "order": WorkOrderResponse.model_validate(order).model_dump(mode="json"),
+                },
+            }
 
     async def _handle_sdk_stream(self, intent: dict, question: str):
         """SDK 集成流式版：检索 SDK 文档 + 流式生成 + 置信度评估"""

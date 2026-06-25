@@ -23,7 +23,7 @@ async def chat(
     async def event_generator():
         full_answer = ""
         done_event = None
-        async for event in svc.answer_stream(body.question, user_id=user_id):
+        async for event in svc.answer_stream(body.question, user_id=user_id, conversation_id=body.conversation_id):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             if event.get("token") and not event.get("done"):
                 full_answer += event["token"]
