@@ -111,7 +111,7 @@ class KbService:
                 new_milvus_ids.append(chunk.id)
 
             milvus.insert(collection_name=COLLECTION_NAME,data=milvus_data)
-            milvus.flush()
+            milvus.flush(collection_name=COLLECTION_NAME)
         except Exception as e:
             raise HTTPException(status_code=500,detail=f"Milvus写入失败：{e}")
 
