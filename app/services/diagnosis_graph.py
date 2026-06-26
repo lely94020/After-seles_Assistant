@@ -20,6 +20,8 @@ class DiagnosisState(TypedDict):
     diagnosis_plan:list[str]    #排查步骤列表
     step_index:int
     resolved:bool
+    topic_changed:bool  #用户是否换了话题
+    new_topic_question:str  #换话题后的新问题
 
 #节点函数
 DIAGNOSIS_SYSTEM_PROMPT="""你是海康威视售后故障诊断专家。你正在和设备运维人员逐步排查一个问题。
@@ -176,13 +178,22 @@ async def process_feedback_node(state:DiagnosisState)->dict:
         "append_checked":["已确认的事实"],
         "append_ruled_out":["已排除的可能"],
         "is_resolved":true或false,
-        "resolution":"问题原因总结（若已解决）"
+        "resolution":"问题原因总结（若已解决）",
+        "topic_changed":true或false,
+        "new_topic":"用户的新问题原文（仅topic_changed=true时填写）"
     }}
 
     is_resolved 判断规则：
     - 用户明确表示问题已解决（如"解决了"、"正常了"、"搞定了"、"可以了"）→ true
     - 用户反馈表明根因已找到且可自行处理（如"红外灯坏了，我去换一个"）→ true
     - 用户仍在描述新现象、继续排查、表示还未验证 → false
+    - 无法确定 → false
+
+    topic_changed 判断规则：
+    - 用户明确表示不想继续排查（如"算了"、"不查了"、"换个问题"）→ true
+    - 用户突然提出与当前故障诊断完全无关的问题（如保修查询、SDK集成、产品推荐、天气闲聊等）→ true
+    - 用户继续描述故障相关的信息（如补充现象、回答排查问题、描述新症状）→ false
+    - 用户表达不满但仍围绕故障话题（如"你们产品怎么这么差"）→ false
     - 无法确定 → false
 """
     import asyncio,json
@@ -215,16 +226,22 @@ async def process_feedback_node(state:DiagnosisState)->dict:
     kf["ruled_out"]=ruled_out
 
     next_idx = state.get("step_index", 0) + 1
+    topic_changed = parsed.get("topic_changed", False)
 
     return {
         "key_facts": kf,
         "resolved": parsed.get("is_resolved", False),
         "current_step": "process_feedback",
         "step_index": next_idx,
+        "topic_changed": topic_changed,
+        "new_topic_question": parsed.get("new_topic", "") if topic_changed else "",
     }
 
-def route_after_feedback(state:DiagnosisState)->Literal["continue","resolve","escalate"]:
+def route_after_feedback(state:DiagnosisState)->Literal["continue","resolve","escalate","topic_change"]:
     """条件路由：根据用户反馈决定下一步"""
+    if state.get("topic_changed"):
+        return "topic_change"
+
     if state.get("resolved"):
         return "resolve"
 
@@ -267,10 +284,18 @@ async def escalate_node(state:DiagnosisState)->dict:
         "messages":[{
             "role":"assistant",
             "content":"##建议转人工处理\n\n"
-            "经过多轮排查，自动诊断未能完全定位问题。建议您：\n\n"  
-            "**联系海康技术支持**：400-800-5998\n"                 
+            "经过多轮排查，自动诊断未能完全定位问题。建议您：\n\n"
+            "**联系海康技术支持**：400-800-5998\n"
             f"### 排查摘要\n{_format_key_facts(state)}"
         }],
+    }
+
+async def topic_change_node(state:DiagnosisState)->dict:
+    """节点7:用户换话题，结束诊断流程"""
+    return {
+        "current_step":"topic_change",
+        "resolved":False,
+        "topic_changed":True,
     }
 
 #-------构建Graph----------
@@ -288,6 +313,7 @@ async def build_diagnosis_graph():
     graph.add_node("process_feedback", process_feedback_node)   #处理反馈，接收并分析用户的回复
     graph.add_node("resolve", resolve_node)     #解决，当问题确认解决时执行的操作
     graph.add_node("escalate", escalate_node)   #升级，当系统无法解决或超出范围时，转交人工处理
+    graph.add_node("topic_change", topic_change_node) #换话题，用户中途换了话题时执行
 
     graph.set_entry_point("intent_classify")
     graph.add_edge("intent_classify","generate_plan")
@@ -299,11 +325,13 @@ async def build_diagnosis_graph():
             "continue":"ask_step",
             "resolve":"resolve",
             "escalate":"escalate",
+            "topic_change":"topic_change",
         },
     )
     graph.add_edge("ask_step","process_feedback")
     graph.add_edge("resolve",END)
     graph.add_edge("escalate",END)
+    graph.add_edge("topic_change",END)
 
     return graph.compile(
         checkpointer=saver,

@@ -75,6 +75,51 @@ class DiagnosisService:
 
         current_node=result.get("current_step","")
 
+        # 用户换话题：关闭诊断，用 QA 引擎处理新问题
+        if result.get("topic_changed"):
+            new_question = result.get("new_topic_question", "").strip()
+            if not new_question:
+                new_question = user_input  # fallback
+
+            await self.conv_svc.close(conv.id, "resolved")
+
+            # 用 QA 引擎生成新话题的回答
+            full_answer = ""
+            citations = []
+            intent_primary = "unclear"
+            new_conv_id = None
+            try:
+                async for event in self.qa_svc.answer_stream(new_question, user_id=user_id):
+                    if event.get("token") and not event.get("done"):
+                        full_answer += event["token"]
+                    if event.get("done"):
+                        citations = event.get("citations", [])
+                        intent_primary = event.get("intent", {}).get("primary", "unclear")
+                        if event.get("conversation_id"):
+                            new_conv_id = event["conversation_id"]
+            except Exception as e:
+                logger.error(f"换话题后 QA 引擎处理失败: {e}")
+                full_answer = "好的，我已了解您想换个话题。请重新描述您的问题，我会为您解答。"
+
+            if full_answer:
+                await self.conv_svc.add_message(conv.id, "assistant", full_answer,
+                    citations=citations, intent=intent_primary)
+
+            resp = {
+                "conversation_id": conv.id,
+                "answer": full_answer or "好的，请问您想了解什么？",
+                "status": "topic_changed",
+                "step_index": result.get("step_index", 0),
+                "total_steps": len(result.get("diagnosis_plan", [])),
+                "key_facts": result.get("key_facts", {}),
+                "work_order_created": False,
+            }
+            # 如果 QA 引擎创建了新会话（如新故障诊断），传递给前端
+            if new_conv_id:
+                resp["new_conversation_id"] = new_conv_id
+                resp["new_intent"] = intent_primary
+            return resp
+
         #提取本轮新增的 assistant 消息（排除 checkpoint 中已有的历史消息）
         skip_count=len(state_before.values.get("messages",[])) + 1 if state_before else 0
         last_assistant_msg=""

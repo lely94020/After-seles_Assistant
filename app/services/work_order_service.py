@@ -90,7 +90,8 @@ class WorkOrderService:
         r = await self.db.execute(
             select(WorkOrder)
             .where(WorkOrder.id == order_id)
-            .options(selectinload(WorkOrder.notes))
+            .options(selectinload(WorkOrder.notes)) #selectinload 会自动在当前查询后追加一条 SELECT ... WHERE id IN (...) 的语句，
+            # 一次性将关联的 notes 数据加载到内存中，避免后续访问时的多次数据库查询
         )
         return r.scalar_one_or_none()
 
