@@ -127,6 +127,22 @@ async def get_work_order(
     return await _build_order_response(svc, order)
 
 
+@router.delete("/{order_id}")
+async def delete_work_order(
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """删除工单"""
+    svc = WorkOrderService(db)
+    order = await svc.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="工单不存在")
+
+    await svc.delete(order_id)
+    await db.commit()
+    return {"ok": True}
+
+
 @router.put("/{order_id}/status", response_model=WorkOrderResponse)
 async def update_work_order_status(
     order_id: int,

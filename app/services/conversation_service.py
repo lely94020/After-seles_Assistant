@@ -111,6 +111,13 @@ class ConversationService:
         await redis.delete(f"session:{conv_id}")
         await self._cleanup_checkpoint(redis, conv_id)
 
+        # 解除工单对本对话的外键引用
+        from app.models.work_order import WorkOrder
+        await self.db.execute(
+            update(WorkOrder)
+            .where(WorkOrder.conversation_id == conv_id)
+            .values(conversation_id=None)
+        )
         # 先删消息（外键约束），再删对话
         await self.db.execute(
             delete(Message).where(Message.conversation_id == conv_id)

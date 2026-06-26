@@ -4,6 +4,7 @@ from sqlalchemy import select, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
+from app.models.conversation import Message
 from app.services.intent_service import IntentService
 from app.services.hybrid_search_service import HybridSearchService
 from app.services.llm_service import LLMService
@@ -492,7 +493,7 @@ class QAService:
         yield done_event
 
     async def _handle_warranty_followup(self, conv, question: str, user_id: int | None = None):
-        """保修对话后续：增量提取工单信息 → 校验 → 创建工单或继续追问"""
+        """保修对话后续：增量提取 → 冲突检测 → 完整度校验 → 创建工单或追问"""
         from app.services.work_order_service import WorkOrderService
         from app.schemas.work_order import WorkOrderResponse
 
@@ -500,44 +501,93 @@ class QAService:
         await conv_svc.add_message(conv.id, "user", question)
 
         wo_svc = WorkOrderService(self.db)
-
-        # 从最新消息中增量提取（只提取新信息）
-        new_fields = await wo_svc.extract_from_message(question)
-
-        # 与已有字段合并，不覆盖已有值
         kf = conv.key_facts or {}
         extracted = kf.get("_extracted_fields", {})
-        for k, v in new_fields.items():
-            if v and not extracted.get(k):
-                extracted[k] = v
-        # 设备型号也合并
-        if kf.get("device_model") and not extracted.get("device_model"):
-            extracted["device_model"] = kf["device_model"]
+        pending_conflicts = kf.get("_pending_conflicts", [])
 
-        # 保存提取结果到 key_facts
-        kf["_extracted_fields"] = extracted
-        await conv_svc.update_key_facts(conv.id, kf)
+        # 1. 如果有待确认的冲突，先处理冲突
+        if pending_conflicts:
+            conflict = pending_conflicts[0]  # 一次处理一个
+            resolved_value = await wo_svc.resolve_conflict(
+                conflict["field"], conflict["old_value"], conflict["new_value"], question
+            )
+            extracted[conflict["field"]] = resolved_value
+            pending_conflicts = pending_conflicts[1:]  # 移除已处理的冲突
 
+            kf["_extracted_fields"] = extracted
+            kf["_pending_conflicts"] = pending_conflicts
+            await conv_svc.update_key_facts(conv.id, kf)
+        else:
+            # 2. 从最新消息中增量提取（支持模糊描述推断）
+            known_models = await wo_svc._get_known_device_models()
+            new_fields = await wo_svc.extract_from_message(question, known_models=known_models)
+
+            # 3. 与已有字段合并，不覆盖已有值
+            for k, v in new_fields.items():
+                if v and not extracted.get(k):
+                    extracted[k] = v
+            if kf.get("device_model") and not extracted.get("device_model"):
+                extracted["device_model"] = kf["device_model"]
+
+            # 4. 检测冲突
+            conflicts = wo_svc.detect_conflicts(kf.get("_extracted_fields", {}), new_fields)
+            if conflicts:
+                kf["_pending_conflicts"] = conflicts
+                kf["_extracted_fields"] = extracted
+                await conv_svc.update_key_facts(conv.id, kf)
+
+                # 用 LLM 生成冲突确认追问
+                followup = await wo_svc.generate_followup_question(
+                    missing_fields=[], extracted=extracted, conflicts=conflicts
+                )
+                await conv_svc.add_message(conv.id, "assistant", followup, intent="warranty_service")
+                yield {"token": followup, "done": False}
+                yield {
+                    "token": "", "done": True,
+                    "confidence": 0.8, "disposition": "direct",
+                    "citations": [], "intent": {"primary": "warranty_service"},
+                    "conversation_id": conv.id,
+                }
+                return
+
+            # 无冲突，保存提取结果
+            kf["_extracted_fields"] = extracted
+            await conv_svc.update_key_facts(conv.id, kf)
+
+        # 5. 完整度校验
         order_type = extracted.get("order_type", "fault_repair")
         missing = wo_svc.check_completeness(extracted, order_type)
 
         if missing:
-            # 信息不完整，继续追问
-            followup = wo_svc.generate_followup_question(missing)
+            # 用 LLM 生成自然语言追问（带上下文）
+            conv_messages = await self.db.execute(
+                select(Message)
+                .where(Message.conversation_id == conv.id)
+                .order_by(Message.created_at.desc())
+                .limit(5)
+            )
+            recent_msgs = list(conv_messages.scalars().all())
+            recent_msgs.reverse()
+            history_text = "\n".join(
+                f"{'用户' if m.role == 'user' else '助手'}: {m.content[:80]}"
+                for m in recent_msgs
+            )
+
+            followup = await wo_svc.generate_followup_question(
+                missing_fields=missing, extracted=extracted,
+                conversation_history=history_text
+            )
             await conv_svc.add_message(conv.id, "assistant", followup, intent="warranty_service")
 
             yield {"token": followup, "done": False}
             yield {
-                "token": "",
-                "done": True,
-                "confidence": 0.8,
-                "disposition": "direct",
-                "citations": [],
-                "intent": {"primary": "warranty_service"},
+                "token": "", "done": True,
+                "confidence": 0.8, "disposition": "direct",
+                "citations": [], "intent": {"primary": "warranty_service"},
                 "conversation_id": conv.id,
             }
         else:
-            # 信息完整，创建工单
+            # 6. 信息完整，创建工单
             order = await wo_svc.create(
                 user_id=user_id or conv.user_id,
                 order_type=order_type,
@@ -548,8 +598,6 @@ class QAService:
                 conversation_id=conv.id,
             )
             await self.db.commit()
-
-            # 重新加载工单（含 notes 关联），避免异步懒加载报错
             order = await wo_svc.get(order.id)
 
             answer = (
@@ -565,12 +613,9 @@ class QAService:
 
             yield {"token": answer, "done": False}
             yield {
-                "token": "",
-                "done": True,
-                "confidence": 0.95,
-                "disposition": "direct",
-                "citations": [],
-                "intent": {"primary": "warranty_service"},
+                "token": "", "done": True,
+                "confidence": 0.95, "disposition": "direct",
+                "citations": [], "intent": {"primary": "warranty_service"},
                 "conversation_id": conv.id,
                 "work_order": {
                     "created": True,
