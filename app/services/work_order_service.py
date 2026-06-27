@@ -43,6 +43,13 @@ FIELD_LABELS = {
     "serial_number_or_device_model": "设备型号/序列号",
 }
 
+ORDER_TYPE_LABELS = {
+    "fault_repair": "故障报修",
+    "general_inquiry": "一般咨询",
+    "installation": "安装服务",
+    "other": "其他",
+}
+
 
 class WorkOrderService:
     def __init__(self, db: AsyncSession):
@@ -373,11 +380,14 @@ class WorkOrderService:
             new_val = new_fields.get(key)
             if old_val and new_val and old_val != new_val:
                 label = FIELD_LABELS.get(key, key)
+                # 显示时将 order_type 翻译为中文
+                display_old = ORDER_TYPE_LABELS.get(old_val, old_val) if key == "order_type" else old_val
+                display_new = ORDER_TYPE_LABELS.get(new_val, new_val) if key == "order_type" else new_val
                 conflicts.append({
                     "field": key,
                     "old_value": old_val,
                     "new_value": new_val,
-                    "message": f"{label}：之前记录的是「{old_val}」，但您现在提到了「{new_val}」，以哪个为准？",
+                    "message": f"{label}：之前记录的是「{display_old}」，但您现在提到了「{display_new}」，以哪个为准？",
                 })
 
         # fault_description 用 LLM 判断是否矛盾
@@ -395,16 +405,23 @@ class WorkOrderService:
 
     async def resolve_conflict(self, field: str, old_value: str, new_value: str, user_reply: str) -> str:
         """用 LLM 判断用户回复是选择了哪个值，还是提供了新值"""
+        # order_type 需要展示中文给 LLM，以便匹配用户回复
+        if field == "order_type":
+            display_old = f"{old_value}（{ORDER_TYPE_LABELS.get(old_value, old_value)}）"
+            display_new = f"{new_value}（{ORDER_TYPE_LABELS.get(new_value, new_value)}）"
+        else:
+            display_old = old_value
+            display_new = new_value
         prompt = f"""用户在确认工单信息时有以下冲突：
 - 字段：{FIELD_LABELS.get(field, field)}
-- 旧值：{old_value}
-- 新值：{new_value}
+- 旧值：{display_old}
+- 新值：{display_new}
 - 用户回复：{user_reply}
 
-请判断用户的选择，只输出最终确认的值（直接输出值，不要其他文字）：
-- 如果用户选择了旧值或新值之一，输出对应的那个值
+请判断用户的选择，只输出最终确认的原始值（即冒号前的英文标识，不要输出中文）：
+- 如果用户选择了旧值或新值之一，输出对应的原始值
 - 如果用户提供了新的值，输出用户的新值
-- 如果无法判断，输出新值"""
+- 如果无法判断，输出新值的原始值"""
 
         result = await self._llm_call("qwen-turbo", prompt)
         return result.strip().strip('"').strip("'") or new_value

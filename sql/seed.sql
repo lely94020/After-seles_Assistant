@@ -32,6 +32,46 @@ INSERT INTO devices (id, model_number, product_series, product_name, category, s
 (5, 'DS-2CD2T47G2-L', '2系列智能', '400万全彩网络摄像机', '前端产品-固定摄像机',
  '{"resolution": "2560x1440", "lens": "2.8mm/4mm", "ir_distance": "30m", "poe": true, "power": "DC12V/PoE", "smart_features": ["human_detection", "line_crossing"]}', 24, 'active');
 
+-- 设备型号详细信息
+INSERT INTO device_model_info (model_number, product_series, product_name, category, specifications, wiring_diagram, firmware_versions, knowledge_base_docs, warranty_months, status) VALUES
+('DS-2CD3T86FWDV2', '3系列', '800万全彩网络摄像机', '前端产品-固定摄像机',
+ '{"resolution": "3840x2160", "lens": "2.8mm/4mm/6mm", "ir_distance": "50m", "poe": true, "power": "DC12V/PoE", "working_temp": "-30°C~60°C", "protection": "IP67"}',
+ '/uploads/wiring/DS-2CD3T86FWDV2.pdf',
+ '["V5.7.0", "V5.7.1", "V5.7.2"]',
+ '["doc_camera_setup", "doc_troubleshooting"]',
+ 36, 'active'),
+('DS-7608NI-K2/8P', '76N系列', '8路网络硬盘录像机', '后端产品-NVR',
+ '{"channels": 8, "hdd_bays": 2, "max_hdd": "10TB each", "resolution": "up to 8MP", "poe_ports": 8, "network": "RJ45 10/100/1000Mbps", "power": "DC12V"}',
+ '/uploads/wiring/DS-7608NI-K2.pdf',
+ '["V4.62.000", "V4.62.100"]',
+ '["doc_nvr_setup", "doc_nvr_troubleshooting"]',
+ 24, 'active'),
+('DS-K1T671M', '门禁系列', '人脸识别门禁一体机', '门禁设备',
+ '{"display": "7寸触摸屏", "capacity_face": 20000, "capacity_card": 50000, "recognition_speed": "<0.2s", "working_temp": "-30°C~60°C", "protection": "IP65"}',
+ '/uploads/wiring/DS-K1T671M.pdf',
+ '["V2.0.0", "V2.0.1"]',
+ '["doc_access_control_setup"]',
+ 24, 'active'),
+('DS-2CD7A87G0', '7系列', '800万智能网络摄像机', '前端产品-固定摄像机',
+ '{"resolution": "3840x2160", "ai_features": ["face_capture", "vehicle_detection", "perimeter_protection"], "lens": "2.8-12mm电动变焦", "ir_distance": "80m", "poe": true, "power": "DC12V/PoE/AC24V"}',
+ '/uploads/wiring/DS-2CD7A87G0.pdf',
+ '["V5.7.0", "V5.7.1", "V5.8.0"]',
+ '["doc_ai_camera_guide", "doc_perimeter_config"]',
+ 36, 'active'),
+('DS-2CD2T47G2-L', '2系列智能', '400万全彩网络摄像机', '前端产品-固定摄像机',
+ '{"resolution": "2560x1440", "lens": "2.8mm/4mm", "ir_distance": "30m", "poe": true, "power": "DC12V/PoE", "smart_features": ["human_detection", "line_crossing"]}',
+ '/uploads/wiring/DS-2CD2T47G2-L.pdf',
+ '["V5.7.0", "V5.7.1"]',
+ '["doc_camera_setup"]',
+ 24, 'active');
+
+-- 设备序列号数据
+INSERT INTO device_serial_numbers (serial_number, model_number, purchase_date, purchase_channel, warranty_start_date, warranty_end_date, customer_info) VALUES
+('C202301000001', 'DS-2CD3T86FWDV2', '2023-01-15', '授权经销商', '2023-01-15', '2026-01-15', '{"name": "杭州安盾系统集成有限公司", "contact": "张伟", "phone": "13800001001"}'),
+('C202301000002', 'DS-2CD3T86FWDV2', '2023-01-15', '授权经销商', '2023-01-15', '2026-01-15', '{"name": "杭州安盾系统集成有限公司", "contact": "张伟", "phone": "13800001001"}'),
+('DS7608NI20230815001', 'DS-7608NI-K2/8P', '2023-08-15', '官方直销', '2023-08-15', '2025-08-15', '{"name": "深圳市海安科技有限公司", "contact": "李娜", "phone": "13900002002"}'),
+('K1T20240301001', 'DS-K1T671M', '2024-03-01', '授权经销商', '2024-03-01', '2026-03-01', '{"name": "绿城物业管理有限公司", "contact": "王芳", "phone": "13700003003"}');
+
 -- 对话数据
 INSERT INTO conversations (id, user_id, title, status, intent_type, key_facts, message_count, resolved_by_ai) VALUES
 (1, 1, 'DS-2CD3T86FWDV2 多台设备离线排查', 'resolved', 'fault_diagnosis',

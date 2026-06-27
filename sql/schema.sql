@@ -127,6 +127,38 @@ CREATE TABLE IF NOT EXISTS kb_documents (
     INDEX idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS device_model_info (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    model_number VARCHAR(100) NOT NULL UNIQUE,
+    product_series VARCHAR(100),
+    product_name VARCHAR(255),
+    category VARCHAR(100),
+    specifications JSON,
+    wiring_diagram VARCHAR(500),
+    firmware_versions JSON,
+    knowledge_base_docs JSON,
+    warranty_months INT DEFAULT 24,
+    status ENUM('active', 'discontinued', 'legacy') DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS device_serial_numbers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    serial_number VARCHAR(100) NOT NULL UNIQUE,
+    model_number VARCHAR(100) NOT NULL,
+    purchase_date DATE,
+    purchase_channel VARCHAR(100),
+    warranty_start_date DATE,
+    warranty_end_date DATE,
+    customer_info JSON,
+    status ENUM('active', 'returned', 'scrapped') DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_dsn_model_number (model_number),
+    INDEX idx_dsn_serial_number (serial_number)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS kb_chunks (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     document_id BIGINT NOT NULL,

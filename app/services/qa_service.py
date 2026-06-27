@@ -1,3 +1,4 @@
+import json
 import logging
 
 from sqlalchemy import select, Integer
@@ -12,6 +13,22 @@ from app.services.confidence_service import ConfidenceService
 from app.services.conversation_service import ConversationService
 
 logger = logging.getLogger(__name__)
+
+WARRANTY_SYSTEM_PROMPT = """你是海康威视售后技术支持专家，负责处理保修查询和报修相关问题。
+
+规则：
+1. 如果用户询问设备信息、保修状态、是否在保、设备规格、固件版本等问题，使用 query_device_info 工具查询
+2. 根据工具返回的结构化数据，用自然语言为用户解释保修状态和设备信息
+3. 保修状态说明：
+   - active = 在保，告知剩余天数
+   - expired = 已过保，建议联系售后或授权服务商
+   - unknown = 无法确认，建议提供购买凭证
+4. 如果工具返回为空（model_info 和 serial_info 都为 null），礼貌告知用户未查到该设备信息，建议核实型号或序列号
+5. 使用 Markdown 格式输出，关键信息用**加粗**
+6. 涉及报修时，引导用户补充故障描述和联系方式
+7. 如需报修，提醒联系海康技术支持：400-800-5998
+8. **严禁编造设备型号、序列号等信息。如果用户未提供设备信息，请直接询问用户需要报修的设备型号或序列号，不要调用工具**
+"""
 
 
 class QAService:
@@ -270,52 +287,39 @@ class QAService:
             "historical_resolve_rate":await self.get_historical_resolve_rate(intent.get("primary_intent", "")),
         }
 
-    async def _handle_warranty(self,intent:dict)->dict:
-        """保修查询：查 Device 表获取保修信息，并检索知识库中保修政策"""
-        model=intent.get("model_number")
+    async def _handle_warranty(self, intent: dict) -> dict:
+        """保修查询：LLM 工具调用 → 查询设备信息 → 生成回答"""
+        from app.services.device_info_service import DEVICE_QUERY_TOOL, execute_device_query_tool
 
-        # 从 Device 表查设备信息
-        from sqlalchemy import select
-        from app.models.device import Device
-        device_info = None
-        if model:
-            r = await self.db.execute(
-                select(Device).where(Device.model_number == model)
-            )
-            device_info = r.scalar_one_or_none()
+        model = intent.get("model_number")
+        serial_number = intent.get("serial_number")
 
-        # 同时检索知识库中的保修政策文档
+        # 工具执行器闭包
+        async def tool_executor(tool_name: str, arguments: dict) -> str:
+            if tool_name == "query_device_info":
+                return await execute_device_query_tool(arguments, self.db)
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        # 检索知识库中的保修政策文档
         retrieved = await self.hybrid_search.search(
             query="保修政策 保修期限 售后服务",
             model_number=model,
             top_k=5,
         )
-        answer_text, citations = await LLMService.generate(
-            query=f"用户查询保修信息，型号={model or'未提供'}，请结合设备信息和检索到的保修政策回答",
-            retrieved_docs=retrieved,
-        )
 
-        answer_parts=[]
-        if device_info:
-            answer_parts.append(
-                f"## {device_info.product_name or model} 保修信息\n\n"
-                f"- **型号**：{device_info.model_number}\n"
-                f"- **保修期限**：{device_info.warranty_months} 个月\n"
-                f"- **产品状态**：{device_info.status}\n"
+        # LLM 工具调用：仅当用户提供了设备信息时才查询
+        if model or serial_number:
+            full_answer, citations, tool_log = await LLMService.generate_with_tools(
+                query=f"用户查询保修信息，型号={model or '未提供'}，序列号={serial_number or '未提供'}",
+                retrieved_docs=retrieved,
+                tools=[DEVICE_QUERY_TOOL],
+                tool_executor=tool_executor,
+                system_prompt=WARRANTY_SYSTEM_PROMPT,
             )
         else:
-            answer_parts.append(
-                f"## 保修查询\n\n"
-                f"未查询到型号 {model} 的设备信息，请确认型号是否正确。\n" if model
-                else "请提供设备型号，以便查询保修信息。\n"
-            )
-
-        answer_parts.append(
-            "\n如需报修，请提供设备序列号（S/N 码），"
-            "或直接联系海康技术支持：400-800-5998。"
-        )
-
-        full_answer = "\n".join(answer_parts)
+            full_answer = "您好！感谢您联系海康威视售后技术支持。请问您需要报修什么设备？"
+            citations = []
+            tool_log = []
 
         # 置信度评估（幻觉控制）
         business_context = await self._build_business_context(
@@ -332,9 +336,9 @@ class QAService:
             "answer": confidence_result["safe_answer"],
             "confidence": confidence_result["confidence"],
             "disposition": confidence_result["disposition"],
-            "intent":{"primary":"warranty_service","model_number":model},
-            "citations":citations,
-            "retrieval_count":len(retrieved),
+            "intent": {"primary": "warranty_service", "model_number": model},
+            "citations": citations,
+            "retrieval_count": len(retrieved),
         }
 
     async def _handle_sdk(self, intent: dict, question: str) -> dict:
@@ -379,54 +383,46 @@ class QAService:
         }
 
     async def _handle_warranty_stream(self, intent: dict, user_id: int | None = None, question: str = ""):
-        """保修查询流式版：查设备信息 + 回答 + 创建保修对话 + 追问工单信息"""
+        """保修查询流式版：LLM 工具调用 → 查询设备信息 → 回答 + 创建保修对话 + 追问工单信息"""
+        from app.services.device_info_service import DEVICE_QUERY_TOOL, execute_device_query_tool
+
         model = intent.get("model_number")
+        serial_number = intent.get("serial_number")
 
-        from sqlalchemy import select
-        from app.models.device import Device
-        device_info = None
-        if model:
-            r = await self.db.execute(
-                select(Device).where(Device.model_number == model)
-            )
-            device_info = r.scalar_one_or_none()
+        # 工具执行器闭包
+        async def tool_executor(tool_name: str, arguments: dict) -> str:
+            if tool_name == "query_device_info":
+                return await execute_device_query_tool(arguments, self.db)
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
-        # 先推设备基本信息
-        if device_info:
-            header = (
-                f"## {device_info.product_name or model} 保修信息\n\n"
-                f"- **型号**：{device_info.model_number}\n"
-                f"- **保修期限**：{device_info.warranty_months} 个月\n"
-                f"- **产品状态**：{device_info.status}\n\n"
-            )
-        else:
-            header = (
-                f"## 保修查询\n\n"
-                f"未查询到型号 {model} 的设备信息，请确认型号是否正确。\n\n" if model
-                else "请提供设备型号，以便查询保修信息。\n\n"
-            )
-        yield {"token": header, "done": False}
-
-        # 检索保修政策 + 流式生成
+        # 检索保修政策文档
         retrieved = await self.hybrid_search.search(
             query="保修政策 保修期限 售后服务",
             model_number=model,
             top_k=5,
         )
 
-        all_tokens = header
+        # LLM 工具调用：仅当用户提供了设备信息时才查询，避免 LLM 幻觉编造
+        all_tokens = ""
         citations = []
-        async for chunk in LLMService.generate_stream(
-            query=f"用户查询保修信息，型号={model or '未提供'}，请结合设备信息和检索到的保修政策回答",
-            retrieved_docs=retrieved,
-        ):
-            import json
-            if chunk.startswith('{"citations"'):
-                citations_data = json.loads(chunk)
-                citations = citations_data.get("citations", [])
-            else:
-                all_tokens += chunk
-                yield {"token": chunk, "done": False}
+        if model or serial_number:
+            async for chunk in LLMService.generate_stream_with_tools(
+                query=question,
+                retrieved_docs=retrieved,
+                tools=[DEVICE_QUERY_TOOL],
+                tool_executor=tool_executor,
+                system_prompt=WARRANTY_SYSTEM_PROMPT,
+                status_message="正在查询设备信息...\n\n",
+            ):
+                if chunk.startswith('{"citations"'):
+                    citations_data = json.loads(chunk)
+                    citations = citations_data.get("citations", [])
+                else:
+                    all_tokens += chunk
+                    yield {"token": chunk, "done": False}
+        else:
+            all_tokens = "您好！感谢您联系海康威视售后技术支持。请问您需要报修什么设备？"
+            yield {"token": all_tokens, "done": False}
 
         # 置信度评估
         business_context = await self._build_business_context(
@@ -445,7 +441,7 @@ class QAService:
             conv_svc = ConversationService(self.db)
             conv = await conv_svc.create(
                 user_id=user_id,
-                title=f"保修/报修 - {model or '未知型号'}",
+                title=f"保修/报修 - {model or serial_number or '未知设备'}",
             )
             conversation_id = conv.id
 
@@ -455,6 +451,8 @@ class QAService:
             initial_fields = await wo_svc.extract_from_message(question)
             if model and not initial_fields.get("device_model"):
                 initial_fields["device_model"] = model
+            if serial_number and not initial_fields.get("serial_number"):
+                initial_fields["serial_number"] = serial_number
 
             await conv_svc.update_key_facts(conv.id, {
                 "_intent": "warranty_service",
@@ -553,6 +551,28 @@ class QAService:
             # 无冲突，保存提取结果
             kf["_extracted_fields"] = extracted
             await conv_svc.update_key_facts(conv.id, kf)
+
+        # 4.5 如果刚提取到序列号，通过 LLM 工具调用查询设备信息
+        if extracted.get("serial_number") and not kf.get("_device_info_shown"):
+            from app.services.device_info_service import DEVICE_QUERY_TOOL, execute_device_query_tool
+
+            async def tool_executor(tool_name: str, arguments: dict) -> str:
+                if tool_name == "query_device_info":
+                    return await execute_device_query_tool(arguments, self.db)
+                return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+            info_text, _, _ = await LLMService.generate_with_tools(
+                query=f"用户提供了序列号 {extracted['serial_number']}，请查询该设备的保修状态并告知用户。",
+                retrieved_docs=[],
+                tools=[DEVICE_QUERY_TOOL],
+                tool_executor=tool_executor,
+                system_prompt=WARRANTY_SYSTEM_PROMPT,
+            )
+
+            kf["_device_info_shown"] = True
+            await conv_svc.update_key_facts(conv.id, kf)
+            await conv_svc.add_message(conv.id, "assistant", info_text, intent="warranty_service")
+            yield {"token": info_text, "done": False}
 
         # 5. 完整度校验
         order_type = extracted.get("order_type", "fault_repair")
@@ -673,6 +693,54 @@ class QAService:
             "citations": citations,
             "intent": {"primary": "sdk_integration", "model_number": model},
         }
+
+    def _format_warranty_status(self, query_result, warranty_status: dict | None) -> str:
+        """将序列号查询结果格式化为 markdown 保修状态卡片"""
+        mi = query_result.model_info
+        si = query_result.serial_info
+        lines = ["## 设备保修查询结果\n"]
+        if mi:
+            lines.append(f"- **产品名称**：{mi.product_name or '-'}")
+            lines.append(f"- **设备型号**：{mi.model_number}")
+            lines.append(f"- **产品系列**：{mi.product_series or '-'}")
+        if si:
+            lines.append(f"- **序列号**：{si.serial_number}")
+            lines.append(f"- **购买渠道**：{si.purchase_channel or '-'}")
+            lines.append(f"- **购买日期**：{si.purchase_date or '-'}")
+        if warranty_status:
+            status_label = {"active": "在保", "expired": "已过期"}.get(
+                warranty_status.get("status"), "未知"
+            )
+            lines.append(f"- **保修状态**：{status_label}")
+            lines.append(f"- **保修起始**：{warranty_status.get('start_date', '-')}")
+            lines.append(f"- **保修截止**：{warranty_status.get('end_date', '-')}")
+            remaining = warranty_status.get("remaining_days")
+            if remaining is not None:
+                lines.append(f"- **剩余天数**：{remaining} 天")
+        if mi and mi.firmware_versions:
+            lines.append(f"- **固件版本**：{', '.join(mi.firmware_versions)}")
+        if mi and mi.wiring_diagram:
+            lines.append(f"- **接线图**：[下载]({mi.wiring_diagram})")
+        return "\n".join(lines) + "\n\n"
+
+    def _format_model_info(self, mi) -> str:
+        """将型号查询结果格式化为 markdown 设备规格卡片"""
+        lines = [f"## {mi.product_name or mi.model_number} 设备信息\n"]
+        lines.append(f"- **型号**：{mi.model_number}")
+        lines.append(f"- **产品系列**：{mi.product_series or '-'}")
+        lines.append(f"- **类别**：{mi.category or '-'}")
+        lines.append(f"- **保修期限**：{mi.warranty_months} 个月")
+        if mi.wiring_diagram:
+            lines.append(f"- **接线图**：[下载]({mi.wiring_diagram})")
+        if mi.firmware_versions:
+            lines.append(f"- **固件版本**：{', '.join(mi.firmware_versions)}")
+        if mi.specifications:
+            lines.append("\n**技术规格**：")
+            for k, v in mi.specifications.items():
+                lines.append(f"  - {k}：{v}")
+        if mi.knowledge_base_docs:
+            lines.append(f"\n**相关文档**：{', '.join(mi.knowledge_base_docs)}")
+        return "\n".join(lines) + "\n\n"
 
     def _clarify_response(self, question: str) -> dict:
             return {
