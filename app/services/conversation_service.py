@@ -17,8 +17,8 @@ class ConversationService:
         self.db=db
 
     #---CRUD---
-    async def create(self,user_id:int,title:str="新对话")->Conversation:
-        conv=Conversation(user_id=user_id,title=title)
+    async def create(self,user_id:int,title:str="新对话",intent:str|None=None)->Conversation:
+        conv=Conversation(user_id=user_id,title=title,intent=intent)
         self.db.add(conv)
         await self.db.flush()   #只同步状态但不提交事务。这一步是为了让数据库为 conv 生成自增的主键 id
         await self.db.refresh(conv)     #刷新，获取最新数据
@@ -138,11 +138,14 @@ class ConversationService:
             .values(step_index=step_index)
         )
 
-    async def close(self,conv_id:int,status:str="resolved")->None:
+    async def close(self,conv_id:int,status:str="resolved",resolved_by_ai:bool|None=None)->None:
+        values={"status":status,"closed_at":datetime.now()}
+        if resolved_by_ai is not None:
+            values["resolved_by_ai"]=resolved_by_ai
         await self.db.execute(
             update(Conversation)
             .where(Conversation.id==conv_id)
-            .values(status=status,closed_at=datetime.now())
+            .values(**values)
         )
         redis=await get_redis()
         await redis.delete(f"session:{conv_id}")

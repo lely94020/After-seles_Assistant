@@ -81,7 +81,7 @@ class DiagnosisService:
             if not new_question:
                 new_question = user_input  # fallback
 
-            await self.conv_svc.close(conv.id, "resolved")
+            await self.conv_svc.close(conv.id, "resolved", resolved_by_ai=False)
 
             # 用 QA 引擎生成新话题的回答
             full_answer = ""
@@ -136,9 +136,9 @@ class DiagnosisService:
 
         #判断是否结束
         if result.get("resolved"):
-            await self.conv_svc.close(conv.id,"resolved")
+            await self.conv_svc.close(conv.id,"resolved",resolved_by_ai=True)
         elif result.get("current_step")=="escalate":
-            await self.conv_svc.close(conv.id,"escalated")
+            await self.conv_svc.close(conv.id,"escalated",resolved_by_ai=False)
             # 自动从对话创建工单
             await self._auto_create_work_order(conv.id, user_id, result)
 
@@ -162,6 +162,7 @@ class DiagnosisService:
         conv = await self.conv_svc.create(
             user_id=user_id,
             title=user_input[:50],
+            intent="fault_diagnosis",
         )
 
         # 保存用户消息

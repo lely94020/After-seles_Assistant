@@ -167,6 +167,7 @@ class QAService:
                 conv = await conv_svc.create(
                     user_id=user_id or 1,
                     title=question[:50],
+                    intent="fault_diagnosis",
                 )
                 conversation_id = conv.id
 
@@ -442,6 +443,7 @@ class QAService:
             conv = await conv_svc.create(
                 user_id=user_id,
                 title=f"保修/报修 - {model or serial_number or '未知设备'}",
+                intent="warranty_service",
             )
             conversation_id = conv.id
 
@@ -619,6 +621,9 @@ class QAService:
             )
             await self.db.commit()
             order = await wo_svc.get(order.id)
+
+            # 工单创建成功，关闭会话
+            await conv_svc.close(conv.id, "resolved", resolved_by_ai=True)
 
             answer = (
                 f"工单已自动创建！\n\n"
