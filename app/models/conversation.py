@@ -24,6 +24,8 @@ class Conversation(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
     closed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime,nullable=True)
+    resolved_by_ai: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
 
     messages:Mapped[list["Message"]]=relationship(back_populates="conversation",order_by="Message.created_at")
 
@@ -43,3 +45,4 @@ class Message(Base):
     created_at:Mapped[datetime.datetime]=mapped_column(DateTime,server_default=func.now())
 
     conversation:Mapped["Conversation"]=relationship(back_populates="messages")
+    evaluations:Mapped[list["MessageEvaluation"]]=relationship(back_populates="message")

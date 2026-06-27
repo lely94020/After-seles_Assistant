@@ -37,6 +37,34 @@ async def list_conversations(
     return [ConversationResponse.model_validate(c) for c in convs]
 
 
+@router.get("/admin")
+async def admin_list_conversations(
+        skip: int = 0,
+        limit: int = 20,
+        intent: str | None = Query(None),
+        status: str | None = Query(None),
+        user_type: str | None = Query(None),
+        date_from: str | None = Query(None),
+        date_to: str | None = Query(None),
+        keyword: str | None = Query(None),
+        db: AsyncSession = Depends(get_db),
+):
+    """管理员级全量对话列表，支持过滤"""
+    svc = ConversationService(db)
+    rows, total = await svc.list_all(
+        skip=skip, limit=limit,
+        intent=intent, status=status, user_type=user_type,
+        date_from=date_from, date_to=date_to, keyword=keyword,
+    )
+    items = []
+    for conv, ut in rows:
+        resp = ConversationResponse.model_validate(conv)
+        resp_dict = resp.model_dump()
+        resp_dict["user_type"] = ut
+        items.append(resp_dict)
+    return {"items": items, "total": total}
+
+
 @router.get("/{conv_id}", response_model=ConversationDetailResponse)
 async def get_conversation(
         conv_id: int,

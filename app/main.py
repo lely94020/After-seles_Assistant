@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings
-from app.api import auth, chat, conversations, work_orders, kb, device_info
+from app.api import auth, chat, conversations, work_orders, kb, device_info, evaluations, analytics
 
 scheduler=AsyncIOScheduler()
 
@@ -42,3 +42,5 @@ app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["
 app.include_router(work_orders.router, prefix="/api/v1/work-orders", tags=["工单"])
 app.include_router(kb.router, prefix="/api/v1/kb", tags=["知识库"])
 app.include_router(device_info.router, prefix="/api/v1/device-info", tags=["设备信息"])
+app.include_router(evaluations.router, prefix="/api/v1/evaluations", tags=["质量评价"])
+app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["数据分析"])

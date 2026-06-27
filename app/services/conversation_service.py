@@ -1,10 +1,11 @@
 import logging
 from datetime import datetime,timedelta
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.conversation import Conversation,Message
+from app.models.auth import User
 from app.core.redis_client import get_redis
 
 logger=logging.getLogger(__name__)
@@ -44,6 +45,50 @@ class ConversationService:
             .offset(skip).limit(limit)
         )
         return list(r.scalars().all())
+
+    async def list_all(
+        self,
+        skip: int = 0,
+        limit: int = 20,
+        intent: str | None = None,
+        status: str | None = None,
+        user_type: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        keyword: str | None = None,
+    ) -> tuple[list[tuple[Conversation, str | None]], int]:
+        """管理员级全量对话列表，支持过滤，返回 (conversation, user_type) 元组列表"""
+        query = select(Conversation, User.user_type).join(User, Conversation.user_id == User.id)
+        count_query = select(func.count()).select_from(Conversation).join(User, Conversation.user_id == User.id)
+
+        if intent:
+            query = query.where(Conversation.intent == intent)
+            count_query = count_query.where(Conversation.intent == intent)
+        if status:
+            query = query.where(Conversation.status == status)
+            count_query = count_query.where(Conversation.status == status)
+        if user_type:
+            query = query.where(User.user_type == user_type)
+            count_query = count_query.where(User.user_type == user_type)
+        if date_from:
+            query = query.where(Conversation.created_at >= date_from)
+            count_query = count_query.where(Conversation.created_at >= date_from)
+        if date_to:
+            query = query.where(Conversation.created_at <= date_to + " 23:59:59")
+            count_query = count_query.where(Conversation.created_at <= date_to + " 23:59:59")
+        if keyword:
+            query = query.where(Conversation.title.ilike(f"%{keyword}%"))
+            count_query = count_query.where(Conversation.title.ilike(f"%{keyword}%"))
+
+        total_r = await self.db.execute(count_query)
+        total = total_r.scalar() or 0
+
+        r = await self.db.execute(
+            query.order_by(Conversation.updated_at.desc())
+            .offset(skip).limit(limit)
+        )
+        rows = r.all()
+        return [(row[0], row[1]) for row in rows], total
 
     #----消息管理----
 

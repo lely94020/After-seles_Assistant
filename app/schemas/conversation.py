@@ -18,6 +18,7 @@ class ConversationResponse(BaseModel):
     intent:str|None=None
     key_facts:dict|None=None
     step_index:int
+    user_type:str|None=None
     created_at:datetime|None=None
     updated_at:datetime|None=None
 
