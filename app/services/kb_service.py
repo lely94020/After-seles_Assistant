@@ -220,8 +220,23 @@ class KbService:
         """
         使用列表推导式遍历文档的所有段落（doc.paragraphs），提取段落文本。
         if p.text.strip() 的作用是过滤掉空段落或仅包含空白字符的段落。
+        识别 Word 标题样式并转换为 Markdown 标题格式，以便后续 _split_by_headings 正确提取 p       
+        +arent_title。
         """
-        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        parts = []
+        for p in doc.paragraphs:
+            text = p.text.strip()
+            if not text:
+                continue
+            style_name = (p.style.name or "").lower()
+            if "heading 1" in style_name or style_name.startswith("标题 1"):
+                parts.append(f"# {text}")
+            elif "heading 2" in style_name or style_name.startswith("标题 2"):
+                parts.append(f"## {text}")
+            elif "heading 3" in style_name or style_name.startswith("标题 3"):
+                parts.append(f"### {text}")
+            else:
+                parts.append(text)
         for table in doc.tables:
             """
             对于每个表格，遍历其每一行（table.rows），再遍历每行中的每个单元格（row.cells），提取单元格文本并去除首尾空白。
