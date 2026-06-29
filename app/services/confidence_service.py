@@ -71,10 +71,16 @@ class ConfidenceService:
         """
 
         # ========== 第一层：检索置信度（权重 0.4）==========
-        high_sim = sum(1 for d in retrieved_docs if d.get("score", 0) >= 0.75)
-        ret_score = min(1.0, high_sim / 3.0) * 0.5
-        ret_score += (1.0 if business_context.get("model_hit") else 0.0) * 0.3
-        ret_score += (1.0 if ConfidenceService._has_overlap(retrieved_docs) else 0.3) * 0.2
+        # 适配 RRF 评分体系：基于检索结果数量和排名质量
+        num_docs = len(retrieved_docs)
+        if num_docs > 0:
+            # 有检索结果 → 基础分 0.4，按数量递增（3 篇以上满分）
+            ret_score = 0.4 + min(1.0, num_docs / 3.0) * 0.3
+        else:
+            ret_score = 0.0
+        ret_score += (1.0 if business_context.get("model_hit") else 0.0) * 0.2
+        ret_score += (1.0 if ConfidenceService._has_overlap(retrieved_docs) else 0.3) * 0.1
+        ret_score = min(1.0, ret_score)
 
         # ========== 第二层：生成置信度（权重 0.4）==========
         entities = extract_entities(answer)
@@ -91,11 +97,15 @@ class ConfidenceService:
                         known += 1
             trace_rate = known / len(entities)
         else:
-            trace_rate = 0.0
+            # 无实体（通用问题）→ 不惩罚，给中性分
+            trace_rate = 0.6
             known = 0
 
         gen_score = trace_rate * 0.7
-        gen_score += (1.0 - min(0.3 * (len(entities) - known), 1.0)) * 0.3
+        if entities:
+            gen_score += (1.0 - min(0.3 * (len(entities) - known), 1.0)) * 0.3
+        else:
+            gen_score += 0.3 * 0.5  # 无实体时给一半
 
         # 信号3：模型自评 —— 从回答末尾解析 [自评: 高/中/低]
         self_eval_match = re.search(
@@ -105,22 +115,23 @@ class ConfidenceService:
         if self_eval_match:
             level = self_eval_match.group(1)
             if level == "高":
-                model_self_eval_score = 1.0
+                model_self_eval_score = 0.9
             elif level == "中":
-                model_self_eval_score = 0.5
+                model_self_eval_score = 0.6
             else:  # 低
-                model_self_eval_score = 0.0  # 模型自己说"低" → 直接降级
+                model_self_eval_score = 0.2
         else:
-            model_self_eval_score = 0.3  # 未按要求输出自评 → 扣分
+            # 未输出自评 → 中性分，不扣分
+            model_self_eval_score = 0.6
 
-        gen_score = gen_score * 0.8 + model_self_eval_score * 0.2
+        gen_score = gen_score * 0.7 + model_self_eval_score * 0.3
 
         # ========== 第三层：业务置信度（权重 0.2）==========
-        biz_score = 0.5
+        biz_score = 0.6
         if business_context.get("is_high_risk"):
-            biz_score -= 0.2
+            biz_score -= 0.15
         if not business_context.get("device_exists"):
-            biz_score -= 0.2
+            biz_score -= 0.05  # 未提型号是常见情况，轻微扣分
         hist_rate = business_context.get("historical_resolve_rate", 0.5)
         biz_score += (hist_rate - 0.5) * 0.4
 
