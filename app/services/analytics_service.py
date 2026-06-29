@@ -1,10 +1,11 @@
-from datetime import datetime, date
-from sqlalchemy import select, func, case
+from datetime import datetime, date, timedelta
+from sqlalchemy import select, func, case, cast, Date
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conversation import Conversation, Message
 from app.models.evaluation import MessageEvaluation
 from app.models.work_order import WorkOrder
+from app.models.kb import KbDocument
 
 
 class AnalyticsService:
@@ -213,3 +214,179 @@ class AnalyticsService:
             })
 
         return suggestions
+
+    async def get_top_questions(self, days: int = 30, limit: int = 10) -> list[dict]:
+        """高频问题 TOP N：按对话 intent 统计用户提问次数"""
+        since = datetime.now() - timedelta(days=days)
+        r = await self.db.execute(
+            select(
+                Conversation.intent,
+                func.count(Message.id).label("count"),
+            )
+            .join(Message, Message.conversation_id == Conversation.id)
+            .where(
+                Message.role == "user",
+                Message.created_at >= since,
+                Conversation.intent.isnot(None),
+            )
+            .group_by(Conversation.intent)
+            .order_by(func.count(Message.id).desc())
+            .limit(limit)
+        )
+        intent_label = {
+            "fault_diagnosis": "故障诊断",
+            "product_inquiry": "产品咨询",
+            "warranty_service": "保修服务",
+            "sdk_integration": "SDK集成",
+            "general_inquiry": "一般咨询",
+        }
+        return [
+            {"category": intent_label.get(row[0], row[0] or "未知"), "count": row[1]}
+            for row in r.all()
+        ]
+
+    async def get_intent_distribution(self, days: int = 30) -> list[dict]:
+        """意图分类分布"""
+        since = datetime.now() - timedelta(days=days)
+        r = await self.db.execute(
+            select(
+                Conversation.intent,
+                func.count(Conversation.id).label("count"),
+            )
+            .where(
+                Conversation.created_at >= since,
+                Conversation.intent.isnot(None),
+            )
+            .group_by(Conversation.intent)
+            .order_by(func.count(Conversation.id).desc())
+        )
+        intent_label = {
+            "fault_diagnosis": "故障诊断",
+            "product_inquiry": "产品咨询",
+            "warranty_service": "保修服务",
+            "sdk_integration": "SDK集成",
+            "general_inquiry": "一般咨询",
+        }
+        return [
+            {"name": intent_label.get(row[0], row[0] or "未知"), "value": row[1]}
+            for row in r.all()
+        ]
+
+    async def get_resolution_trend(self, days: int = 30) -> list[dict]:
+        """AI 解决率 + 转人工率每日趋势"""
+        since = datetime.now() - timedelta(days=days)
+        r = await self.db.execute(
+            select(
+                cast(Conversation.created_at, Date).label("day"),
+                func.count().label("total"),
+                func.count(case((Conversation.resolved_by_ai == True, 1))).label("ai_resolved"),
+                func.count(case((Conversation.status == "escalated", 1))).label("escalated"),
+            )
+            .where(Conversation.created_at >= since)
+            .group_by(cast(Conversation.created_at, Date))
+            .order_by(cast(Conversation.created_at, Date))
+        )
+        result = []
+        for row in r.all():
+            total = row[1] or 1
+            result.append({
+                "date": str(row[0]),
+                "rate": round(row[2] / total, 4),
+                "transfer_rate": round(row[3] / total, 4),
+            })
+        return result
+
+    async def get_coverage_heatmap(self) -> list[dict]:
+        """知识库覆盖率：按 product_series 统计文档覆盖情况"""
+        # 获取所有产品系列及其文档数
+        r = await self.db.execute(
+            select(
+                KbDocument.product_series,
+                func.count(KbDocument.id).label("doc_count"),
+                func.sum(KbDocument.chunk_count).label("chunk_count"),
+            )
+            .where(KbDocument.status == "active")
+            .group_by(KbDocument.product_series)
+        )
+        series_docs = {row[0]: {"doc_count": row[1], "chunk_count": row[2] or 0} for row in r.all() if row[0]}
+
+        # 获取有工单但无文档的系列（通过 work_orders 的 serial_number 关联）
+        r = await self.db.execute(
+            select(WorkOrder.serial_number)
+            .where(WorkOrder.serial_number.isnot(None))
+            .distinct()
+        )
+        all_serials = [row[0] for row in r.all()]
+
+        # 构建覆盖率数据
+        result = []
+        for series, info in sorted(series_docs.items(), key=lambda x: x[1]["doc_count"], reverse=True):
+            doc_count = info["doc_count"]
+            chunk_count = info["chunk_count"]
+            if doc_count >= 10 and chunk_count >= 50:
+                status = "sufficient"
+                coverage = min(100, 60 + doc_count * 2)
+            elif doc_count >= 3:
+                status = "insufficient"
+                coverage = 30 + doc_count * 5
+            else:
+                status = "missing"
+                coverage = doc_count * 10
+            result.append({
+                "series": series or "未分类",
+                "coverage": min(coverage, 100),
+                "status": status,
+                "doc_count": doc_count,
+                "chunk_count": chunk_count,
+            })
+
+        # 补充：有工单但完全没文档的情况
+        if not result:
+            result.append({"series": "暂无数据", "coverage": 0, "status": "missing", "doc_count": 0, "chunk_count": 0})
+
+        return result
+
+    async def get_model_fault_rate(self, days: int = 30) -> list[dict]:
+        """各型号故障率统计：按设备型号统计工单数"""
+        since = datetime.now() - timedelta(days=days)
+        r = await self.db.execute(
+            select(
+                WorkOrder.serial_number,
+                func.count(WorkOrder.id).label("fault_count"),
+            )
+            .where(
+                WorkOrder.created_at >= since,
+                WorkOrder.order_type == "fault_repair",
+                WorkOrder.serial_number.isnot(None),
+            )
+            .group_by(WorkOrder.serial_number)
+            .order_by(func.count(WorkOrder.id).desc())
+            .limit(15)
+        )
+        return [
+            {"model": row[0] or "未知", "count": row[1]}
+            for row in r.all()
+        ]
+
+    async def get_satisfaction_trend(self, days: int = 30) -> list[dict]:
+        """用户满意度走势：按日统计评价准确率"""
+        since = datetime.now() - timedelta(days=days)
+        r = await self.db.execute(
+            select(
+                cast(MessageEvaluation.created_at, Date).label("day"),
+                func.count().label("total"),
+                func.count(case((MessageEvaluation.quality_label == "accurate", 1))).label("accurate"),
+            )
+            .where(MessageEvaluation.created_at >= since)
+            .group_by(cast(MessageEvaluation.created_at, Date))
+            .order_by(cast(MessageEvaluation.created_at, Date))
+        )
+        result = []
+        for row in r.all():
+            total = row[1] or 1
+            result.append({
+                "date": str(row[0]),
+                "satisfaction_rate": round(row[2] / total, 4),
+                "total_evaluations": row[1],
+            })
+        return result
