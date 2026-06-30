@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.core.security import get_current_user_id
+from app.core.security import get_current_user_id, get_current_user, CurrentUser, require_role
 from app.schemas.work_order import (
     WorkOrderCreate,
     WorkOrderUpdate,
@@ -16,20 +16,42 @@ from app.schemas.work_order import (
     WorkOrderTimelineItem,
 )
 from app.services.work_order_service import WorkOrderService
+from app.services.audit_service import AuditService
 
 router = APIRouter()
+
+# 创建工单：终端客户、系统集成商、经销商
+_CREATE_DEP = Depends(require_role("end_user", "integrator", "distributor"))
+# 删除工单：仅客服主管
+_DELETE_DEP = Depends(require_role("cs_manager"))
+# 更新状态：仅售后网点人员
+_STATUS_DEP = Depends(require_role("service_staff"))
+
+
+async def _check_order_access(order_id: int, user: CurrentUser, svc: WorkOrderService):
+    """校验工单访问权限：本人 / 分配的售后人员 / 客服主管可访问"""
+    order = await svc.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if user.user_type == "cs_manager":
+        return order
+    if user.user_type == "service_staff" and order.assigned_to == user.id:
+        return order
+    if order.user_id == user.id:
+        return order
+    raise HTTPException(status_code=403, detail="无权访问此工单")
 
 
 @router.post("", response_model=WorkOrderResponse)
 async def create_work_order(
     body: WorkOrderCreate,
-    user_id: int = Depends(get_current_user_id),
+    user: CurrentUser = _CREATE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """手动创建工单"""
     svc = WorkOrderService(db)
     order = await svc.create(
-        user_id=user_id,
+        user_id=user.id,
         order_type=body.order_type,
         fault_description=body.fault_description,
         serial_number=body.serial_number,
@@ -39,6 +61,9 @@ async def create_work_order(
         conversation_id=body.conversation_id,
     )
     await db.commit()
+    # 审计
+    audit = AuditService(db)
+    await audit.log(user_id=user.id, action="work_order_create", resource_type="work_order", resource_id=str(order.id))
     return await _build_order_response(svc, order)
 
 
@@ -49,15 +74,24 @@ async def list_work_orders(
     status: str | None = None,
     order_type: str | None = None,
     keyword: str | None = None,
-    user_id: int = Depends(get_current_user_id),
+    user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取工单列表（支持筛选 + 分页）"""
+    """获取工单列表（按角色过滤可见范围）"""
     svc = WorkOrderService(db)
     skip = (page - 1) * page_size
-    orders, total = await svc.list_all(
-        skip=skip, limit=page_size, status=status, order_type=order_type, keyword=keyword
-    )
+
+    if user.user_type == "cs_manager":
+        orders, total = await svc.list_all(
+            skip=skip, limit=page_size, status=status, order_type=order_type, keyword=keyword
+        )
+    elif user.user_type == "service_staff":
+        orders, total = await svc.list_by_assigned_to(
+            user.id, skip=skip, limit=page_size, status=status, order_type=order_type, keyword=keyword
+        )
+    else:
+        orders = await svc.list_by_user(user_id=user.id, skip=skip, limit=page_size)
+        total = len(orders)
 
     items = []
     for o in orders:
@@ -78,7 +112,6 @@ async def list_work_orders(
             created_at=o.created_at,
             updated_at=o.updated_at,
         ))
-
     return WorkOrderListResult(items=items, total=total)
 
 
@@ -117,27 +150,26 @@ async def list_my_work_orders(
 @router.get("/{order_id}", response_model=WorkOrderResponse)
 async def get_work_order(
     order_id: int,
+    user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """获取工单详情（含 timeline）"""
     svc = WorkOrderService(db)
-    order = await svc.get(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="工单不存在")
+    order = await _check_order_access(order_id, user, svc)
     return await _build_order_response(svc, order)
 
 
 @router.delete("/{order_id}")
 async def delete_work_order(
     order_id: int,
+    user: CurrentUser = _DELETE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
-    """删除工单"""
+    """删除工单（仅客服主管）"""
     svc = WorkOrderService(db)
     order = await svc.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="工单不存在")
-
     await svc.delete(order_id)
     await db.commit()
     return {"ok": True}
@@ -147,27 +179,28 @@ async def delete_work_order(
 async def update_work_order_status(
     order_id: int,
     body: WorkOrderUpdate,
-    user_id: int = Depends(get_current_user_id),
+    user: CurrentUser = _STATUS_DEP,
     db: AsyncSession = Depends(get_db),
 ):
-    """更新工单状态"""
+    """更新工单状态（仅售后网点人员）"""
     svc = WorkOrderService(db)
     order = await svc.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="工单不存在")
-
     if not body.status:
         raise HTTPException(status_code=400, detail="status 不能为空")
-
     updated = await svc.update_status(
         order_id=order_id,
         status=body.status,
-        operator_id=user_id,
+        operator_id=user.id,
         resolution=body.resolution,
         assigned_to=body.assigned_to,
         note=body.note,
     )
     await db.commit()
+    # 审计
+    audit = AuditService(db)
+    await audit.log(user_id=user.id, action="work_order_status_change", resource_type="work_order", resource_id=str(order_id), detail={"new_status": body.status})
     return await _build_order_response(svc, updated)
 
 
@@ -175,18 +208,15 @@ async def update_work_order_status(
 async def add_work_order_note(
     order_id: int,
     body: WorkOrderNoteCreate,
-    user_id: int = Depends(get_current_user_id),
+    user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """添加工单备注"""
     svc = WorkOrderService(db)
-    order = await svc.get(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="工单不存在")
-
+    await _check_order_access(order_id, user, svc)
     note = await svc.add_note(
         order_id=order_id,
-        operator_id=user_id,
+        operator_id=user.id,
         content=body.content,
         action_type=body.action_type,
     )
@@ -197,13 +227,12 @@ async def add_work_order_note(
 @router.post("/from-conversation/{conv_id}")
 async def create_work_order_from_conversation(
     conv_id: int,
-    user_id: int = Depends(get_current_user_id),
+    user: CurrentUser = _CREATE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """从对话自动创建工单（信息提取 → 完整度校验 → 创建或追问）"""
     svc = WorkOrderService(db)
-    order, missing, followup = await svc.create_from_conversation(conv_id, user_id)
-
+    order, missing, followup = await svc.create_from_conversation(conv_id, user.id)
     if order:
         await db.commit()
         resp = await _build_order_response(svc, order)
@@ -228,7 +257,6 @@ async def _build_order_response(svc: WorkOrderService, order) -> WorkOrderRespon
     timeline_data = await svc.build_timeline(order.notes or [])
     assigned_name = await svc.get_user_name(order.assigned_to) if order.assigned_to else None
     conv_summary = await svc.get_conversation_summary(order.conversation_id)
-
     return WorkOrderResponse(
         id=order.id,
         order_number=order.order_number,

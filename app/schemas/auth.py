@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+
+from app.core.data_mask import mask_phone
 
 
 class LoginRequest(BaseModel):
@@ -25,7 +27,11 @@ class UserResponse(BaseModel):
     is_active: bool
 
     model_config = {"from_attributes": True}
-    # 它允许你直接 UserResponse.model_validate(orm_user_object)，Pydantic 会自动从 ORM 对象的属性中提取值，不用手动一个一个复制
+
+    @field_serializer("phone")  #单独控制phone字段输出格式
+    @classmethod
+    def _mask_phone(cls, v: str | None) -> str | None:
+        return mask_phone(v)
 
 
 class TokenResponse(BaseModel):

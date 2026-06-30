@@ -46,7 +46,10 @@ DIAGNOSIS_SYSTEM_PROMPT="""你是海康威视售后故障诊断专家。你正�
 def _format_key_facts(state:DiagnosisState)->str:
     kf=state.get("key_facts",{})
     lines=[]
+    sensitive_keys={"contact_info","phone","email","_extracted_fields","_pending_conflicts"}
     for k,v in kf.items():
+        if k.startswith("_") or k in sensitive_keys:
+            continue
         if isinstance(v,list):  #判断v是否为列表
             lines.append(f"-{k}:{','.join(str(x)for x in v)}")
         else:

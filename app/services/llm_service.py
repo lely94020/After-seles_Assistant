@@ -9,6 +9,13 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+_SENSITIVE_KEYS = {"api_key", "phone", "email", "contact_info", "serial_number"}
+
+
+def _safe_log_args(args: dict) -> dict:
+    """日志脱敏：隐藏敏感参数值"""
+    return {k: "[REDACTED]" if k in _SENSITIVE_KEYS else v for k, v in args.items()}
+
 SYSTEM_PROMPT = """你是海康威视售后技术支持专家。请根据以下检索到的知识库内容回答用户问题。
 
 规则：
@@ -149,7 +156,7 @@ class LLMService:
             for tc in assistant_msg.tool_calls:
                 func_name = tc["function"]["name"]
                 func_args = json.loads(tc["function"]["arguments"])
-                logger.info(f"LLM 请求工具调用: {func_name}({func_args})")
+                logger.info(f"LLM 请求工具调用: {func_name}({_safe_log_args(func_args)})")
 
                 result = await tool_executor(func_name, func_args)
                 logger.info(f"工具 {func_name} 返回 {len(result)} 字符")
@@ -225,7 +232,7 @@ class LLMService:
             for tc in assistant_msg.tool_calls:
                 func_name = tc["function"]["name"]
                 func_args = json.loads(tc["function"]["arguments"])
-                logger.info(f"LLM 请求工具调用: {func_name}({func_args})")
+                logger.info(f"LLM 请求工具调用: {func_name}({_safe_log_args(func_args)})")
 
                 result = await tool_executor(func_name, func_args)
                 logger.info(f"工具 {func_name} 返回 {len(result)} 字符")

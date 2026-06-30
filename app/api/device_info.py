@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.core.security import CurrentUser, get_current_user, require_role
 from app.services.device_info_service import DeviceInfoService
 from app.schemas.device_info import (
     DeviceModelInfoCreate,
@@ -16,12 +17,18 @@ from app.schemas.device_info import (
 
 router = APIRouter(prefix="/device-info", tags=["设备信息"])
 
+# 读操作：所有已认证用户
+_READ_DEP = Depends(get_current_user)
+# 写操作：仅管理员
+_WRITE_DEP = Depends(require_role("cs_manager", "kb_admin"))
+
 
 # ── 设备型号 ──────────────────────────────────────────────
 
 @router.post("/models", response_model=DeviceModelInfoResponse)
 async def create_device_model(
     device_data: DeviceModelInfoCreate,
+    user: CurrentUser = _WRITE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """创建设备型号信息"""
@@ -35,6 +42,7 @@ async def create_device_model(
 @router.get("/models/{model_number}", response_model=DeviceModelInfoResponse)
 async def get_device_model(
     model_number: str,
+    user: CurrentUser = _READ_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """根据型号获取设备信息"""
@@ -49,6 +57,7 @@ async def get_device_model(
 async def update_device_model(
     model_number: str,
     device_data: DeviceModelInfoUpdate,
+    user: CurrentUser = _WRITE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """更新设备型号信息"""
@@ -62,6 +71,7 @@ async def update_device_model(
 @router.delete("/models/{model_number}")
 async def delete_device_model(
     model_number: str,
+    user: CurrentUser = _WRITE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """删除设备型号信息"""
@@ -74,6 +84,7 @@ async def delete_device_model(
 @router.get("/models/search/{model_number}", response_model=list[DeviceModelInfoResponse])
 async def search_devices_by_model(
     model_number: str,
+    user: CurrentUser = _READ_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """根据型号模糊搜索设备"""
@@ -84,6 +95,7 @@ async def search_devices_by_model(
 @router.get("/models/{model_number}/firmware", response_model=list[str])
 async def get_firmware_versions_by_model(
     model_number: str,
+    user: CurrentUser = _READ_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """根据型号获取固件版本列表"""
@@ -99,6 +111,7 @@ async def get_firmware_versions_by_model(
 @router.post("/serials", response_model=DeviceSerialNumberResponse)
 async def create_device_serial_number(
     serial_data: DeviceSerialNumberCreate,
+    user: CurrentUser = _WRITE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """创建设备序列号信息"""
@@ -112,6 +125,7 @@ async def create_device_serial_number(
 @router.get("/serials/{serial_number}", response_model=DeviceSerialNumberResponse)
 async def get_device_serial_number(
     serial_number: str,
+    user: CurrentUser = _READ_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """根据序列号获取设备信息"""
@@ -126,6 +140,7 @@ async def get_device_serial_number(
 async def update_device_serial_number(
     serial_number: str,
     serial_data: DeviceSerialNumberUpdate,
+    user: CurrentUser = _WRITE_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """更新设备序列号信息"""
@@ -141,6 +156,7 @@ async def update_device_serial_number(
 @router.post("/query", response_model=DeviceQueryResponse)
 async def query_device_info(
     query_data: DeviceQueryRequest,
+    user: CurrentUser = _READ_DEP,
     db: AsyncSession = Depends(get_db),
 ):
     """查询设备信息，支持按型号或序列号查询"""

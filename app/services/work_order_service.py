@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.core.data_mask import sanitize_for_llm
 from app.models.work_order import WorkOrder, WorkOrderNote
 from app.models.conversation import Conversation, Message
 from app.models.device import Device
@@ -164,6 +165,32 @@ class WorkOrderService:
         r = await self.db.execute(stmt)
         return list(r.scalars().all()), total
 
+    async def list_by_assigned_to(
+        self, user_id: int, skip: int = 0, limit: int = 20,
+        status: str | None = None, order_type: str | None = None, keyword: str | None = None,
+    ) -> tuple[list[WorkOrder], int]:
+        """返回分配给指定售后人员的工单列表"""
+        stmt = select(WorkOrder).where(WorkOrder.assigned_to == user_id)
+        count_stmt = select(func.count(WorkOrder.id)).where(WorkOrder.assigned_to == user_id)
+
+        if status:
+            stmt = stmt.where(WorkOrder.status == status)
+            count_stmt = count_stmt.where(WorkOrder.status == status)
+        if order_type:
+            stmt = stmt.where(WorkOrder.order_type == order_type)
+            count_stmt = count_stmt.where(WorkOrder.order_type == order_type)
+        if keyword:
+            like_pattern = f"%{keyword}%"
+            kw_filter = WorkOrder.order_number.ilike(like_pattern) | WorkOrder.fault_description.ilike(like_pattern)
+            stmt = stmt.where(kw_filter)
+            count_stmt = count_stmt.where(kw_filter)
+
+        total_r = await self.db.execute(count_stmt)
+        total = total_r.scalar() or 0
+        stmt = stmt.order_by(WorkOrder.created_at.desc()).offset(skip).limit(limit)
+        r = await self.db.execute(stmt)
+        return list(r.scalars().all()), total
+
     async def update_status(
         self,
         order_id: int,
@@ -300,8 +327,8 @@ class WorkOrderService:
         if not conv:
             return {}
 
-        # 格式化对话历史
-        conversation_text = self._format_conversation(conv.messages or [])
+        # 格式化对话历史（脱敏后再发给 LLM）
+        conversation_text = sanitize_for_llm(self._format_conversation(conv.messages or []))
 
         # 获取已知设备型号辅助推断
         known_models = await self._get_known_device_models()
@@ -510,7 +537,7 @@ class WorkOrderService:
         if not messages:
             return None
 
-        conversation_text = self._format_conversation(messages)
+        conversation_text = sanitize_for_llm(self._format_conversation(messages))
         prompt = f"""请将以下对话总结为一段简洁的工单摘要（3-5句话），包含：
 - 用户的核心问题/需求
 - 已确认的关键信息（设备型号、故障现象等）
@@ -551,7 +578,7 @@ class WorkOrderService:
 - 如果用户明确给了型号（如 DS-2CD2042），confidence 设为 high
 {model_hint}
 用户消息：
-{message}
+{sanitize_for_llm(message)}
 
 只输出 JSON，无其他文字：
 {{"device_model": "xxx或null", "serial_number": "xxx或null", "fault_description": "xxx或null", "contact_info": "xxx或null", "order_type": "fault_repair或null", "confidence": "high"}}"""

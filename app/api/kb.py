@@ -1,89 +1,125 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import get_db
+from app.core.security import CurrentUser, require_role
 from app.schemas.kb import DocumentResponse, DocumentDetailResponse, ScanExpiredResponse, StatusUpdateRequest, TopReferencedResponse
 from app.services.kb_service import KbService
+from app.services.audit_service import AuditService
 
-router=APIRouter()
+router = APIRouter()
 
-@router.post("/upload",response_model=DocumentResponse)
+# 写操作仅限知识库管理员
+_WRITE_DEP = Depends(require_role("kb_admin"))
+# 读操作：知识库管理员 + 客服主管
+_READ_DEP = Depends(require_role("kb_admin", "cs_manager"))
+
+
+@router.post("/upload", response_model=DocumentResponse)
 async def upload(
-        file:UploadFile=File(...),
-        title:str=Form(...),
-        doc_type:str=Form(...),
-        product_model:str|None=Form(None),
-        product_series:str|None=Form(None),
-        replace_doc_id:int|None=Form(None),
-        svc:KbService=Depends(),
-)->DocumentResponse:
-    doc=await svc.upload(
-        file,title,doc_type,
-        product_model,product_series,
-        replace_doc_id
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    doc_type: str = Form(...),
+    product_model: str | None = Form(None),
+    product_series: str | None = Form(None),
+    replace_doc_id: int | None = Form(None),
+    user: CurrentUser = _WRITE_DEP,
+    svc: KbService = Depends(),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentResponse:
+    doc = await svc.upload(
+        file, title, doc_type,
+        product_model, product_series,
+        replace_doc_id,
     )
+    audit = AuditService(db)
+    await audit.log(user_id=user.id, action="kb_upload", resource_type="kb", resource_id=str(doc.id))
     return DocumentResponse.model_validate(doc)
+
 
 @router.get("/search")
 async def search_chunks(
-        q:str=Query(...,description="搜索关键词或问题"),
-        top_k:int=Query(5,ge=1,le=20),
-        svc:KbService=Depends()
+    q: str = Query(..., description="搜索关键词或问题"),
+    top_k: int = Query(5, ge=1, le=20),
+    user: CurrentUser = _READ_DEP,
+    svc: KbService = Depends(),
 ):
     """语义搜索知识库"""
-    hits=await svc.search_chunks(q,top_k)
-    return {"query":q,"results":hits}
+    hits = await svc.search_chunks(q, top_k)
+    return {"query": q, "results": hits}
+
 
 @router.get("/top-referenced", response_model=list[TopReferencedResponse])
 async def top_referenced(
-        limit: int = Query(10, ge=1, le=50),
-        svc: KbService = Depends(),
+    limit: int = Query(10, ge=1, le=50),
+    user: CurrentUser = _READ_DEP,
+    svc: KbService = Depends(),
 ):
     """高频引用文档统计，用于预警重要文档过期"""
     docs = await svc.get_top_referenced(limit)
     return [TopReferencedResponse.model_validate(d) for d in docs]
 
+
 @router.post("/scan-expired", response_model=ScanExpiredResponse)
 async def scan_expired(
-        svc: KbService = Depends(),
+    user: CurrentUser = _WRITE_DEP,
+    svc: KbService = Depends(),
 ) -> ScanExpiredResponse:
     """手动触发过期扫描（>90天 → review_due，>180天 expired → archived）"""
     result = await svc.scan_expired()
     return ScanExpiredResponse(**result)
 
-@router.get("/{doc_id}",response_model=DocumentDetailResponse)
-async def get_document(doc_id:int,svc:KbService=Depends())->DocumentDetailResponse:
-    doc=await svc.get_document(doc_id)
+
+@router.get("/{doc_id}", response_model=DocumentDetailResponse)
+async def get_document(
+    doc_id: int,
+    user: CurrentUser = _READ_DEP,
+    svc: KbService = Depends(),
+) -> DocumentDetailResponse:
+    doc = await svc.get_document(doc_id)
     if not doc:
-        raise HTTPException(status_code=404,detail="文档不存在")
+        raise HTTPException(status_code=404, detail="文档不存在")
     return DocumentDetailResponse.model_validate(doc)
 
-@router.get("/",response_model=list[DocumentResponse])
-async def list_docs(skip:int=0,limit:int=20,svc:KbService=Depends()):
-    docs=await svc.list_documents(skip,limit)
+
+@router.get("/", response_model=list[DocumentResponse])
+async def list_docs(
+    skip: int = 0,
+    limit: int = 20,
+    user: CurrentUser = _READ_DEP,
+    svc: KbService = Depends(),
+):
+    docs = await svc.list_documents(skip, limit)
     return [DocumentResponse.model_validate(d) for d in docs]
+
 
 # ========== 管理员：生命周期管理 ==========
 
+
 @router.patch("/{doc_id}/status", response_model=DocumentResponse)
 async def update_status(
-        doc_id: int,
-        body: StatusUpdateRequest,
-        svc: KbService = Depends(),
+    doc_id: int,
+    body: StatusUpdateRequest,
+    user: CurrentUser = _WRITE_DEP,
+    svc: KbService = Depends(),
+    db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
     """管理员手动修改文档状态（active / review_due / expired / archived）"""
     doc = await svc.update_status(doc_id, body.status)
+    audit = AuditService(db)
+    await audit.log(user_id=user.id, action="kb_status_change", resource_type="kb", resource_id=str(doc_id), detail={"new_status": body.status})
     return DocumentResponse.model_validate(doc)
 
 
 @router.post("/{doc_id}/renew", response_model=DocumentResponse)
 async def renew_document(
-        doc_id: int,
-        svc: KbService = Depends(),
+    doc_id: int,
+    user: CurrentUser = _WRITE_DEP,
+    svc: KbService = Depends(),
+    db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
     """管理员确认文档仍有效，重置 updated_at 并恢复 active"""
     doc = await svc.renew_document(doc_id)
+    audit = AuditService(db)
+    await audit.log(user_id=user.id, action="kb_renew", resource_type="kb", resource_id=str(doc_id))
     return DocumentResponse.model_validate(doc)
-
-
-
-
-

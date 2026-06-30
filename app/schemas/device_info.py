@@ -1,5 +1,7 @@
 from datetime import datetime, date
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+
+from app.core.data_mask import mask_customer_info
 
 
 # ── 设备型号 ──────────────────────────────────────────────
@@ -82,6 +84,11 @@ class DeviceSerialNumberResponse(BaseModel):
     updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+    @field_serializer("customer_info")
+    @classmethod
+    def _mask_customer(cls, v: dict | None) -> dict | None:
+        return mask_customer_info(v)
 
 
 # ── 综合查询 ──────────────────────────────────────────────

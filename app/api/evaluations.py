@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.conversation import Message
 from app.schemas.evaluation import EvaluationCreate, EvaluationResponse, EvaluationListResult
-from app.core.security import get_current_user_id
+from app.core.security import get_current_user_id, get_current_user, CurrentUser, require_role
 from app.services.evaluation_service import EvaluationService
 
 router = APIRouter()
@@ -48,9 +48,10 @@ async def list_evaluations(
         conversation_id: int | None = Query(None),
         skip: int = 0,
         limit: int = 50,
+        user: CurrentUser = Depends(require_role("cs_manager", "kb_admin")),
         db: AsyncSession = Depends(get_db),
 ):
-    """列出评价，支持按对话过滤"""
+    """列出评价，支持按对话过滤（仅客服主管和知识库管理员）"""
     svc = EvaluationService(db)
     if conversation_id:
         items, total = await svc.list_by_conversation(conversation_id, skip=skip, limit=limit)
@@ -61,6 +62,7 @@ async def list_evaluations(
 @router.get("/by-message/{message_id}")
 async def get_evaluation_for_message(
         message_id: int,
+        user: CurrentUser = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
     """获取某条消息的评价"""

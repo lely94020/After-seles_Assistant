@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     JWT_EXPIRE_MINUTES: int
     CORS_ORIGINS: list[str]
     UPLOAD_DIR: str = "uploads"
+    RATE_LIMIT_PER_MINUTE: int = 30
 
     class Config:
         env_file = ".env"

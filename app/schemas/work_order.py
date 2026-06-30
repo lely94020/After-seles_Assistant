@@ -1,5 +1,7 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+
+from app.core.data_mask import mask_contact_info
 
 
 class WorkOrderCreate(BaseModel):
@@ -58,6 +60,11 @@ class WorkOrderResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @field_serializer("contact_info")
+    @classmethod
+    def _mask_contact(cls, v: str | None) -> str | None:
+        return mask_contact_info(v)
+
 
 class WorkOrderListResponse(BaseModel):
     id: int
@@ -75,6 +82,11 @@ class WorkOrderListResponse(BaseModel):
     updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+    @field_serializer("contact_info")
+    @classmethod
+    def _mask_contact(cls, v: str | None) -> str | None:
+        return mask_contact_info(v)
 
 
 class WorkOrderListResult(BaseModel):
