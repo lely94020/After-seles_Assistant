@@ -67,6 +67,10 @@ class QAService:
         )
         logger.info(f"检索到{len(retrieved)}条文档")
 
+        # 检索为空 → 拒绝调用 LLM，直接返回安全话术
+        if not retrieved:
+            return self._empty_retrieval_response(intent["primary_intent"])
+
         # 大模型生成
         answer_text, citations = await LLMService.generate(question, retrieved)
 
@@ -147,6 +151,15 @@ class QAService:
                 model_number=intent.get("model_number"),
                 top_k=10,
             )
+
+            # 检索为空 → 拒绝调用 LLM，直接返回安全话术
+            if not retrieved:
+                response = self._empty_retrieval_response(intent["primary_intent"])
+                yield {"token": response["answer"], "done": False}
+                yield {"token": "", "done": True,
+                       "confidence": 0.0, "disposition": "refuse",
+                       "citations": [], "intent": {"primary": intent["primary_intent"]}}
+                return
 
             # ③ 流式生成
             all_tokens = ""
@@ -352,6 +365,9 @@ class QAService:
             model_number=model,
             top_k=10,
         )
+
+        if not retrieved:
+            return self._empty_retrieval_response("sdk_integration")
 
         answer_text, citations = await LLMService.generate(
             query=f"用户询问 SDK/API 集成问题：{question}。"
@@ -658,6 +674,14 @@ class QAService:
             top_k=10,
         )
 
+        if not retrieved:
+            response = self._empty_retrieval_response("sdk_integration")
+            yield {"token": response["answer"], "done": False}
+            yield {"token": "", "done": True,
+                   "confidence": 0.0, "disposition": "refuse",
+                   "citations": [], "intent": {"primary": "sdk_integration"}}
+            return
+
         all_tokens = ""
         citations = []
         async for chunk in LLMService.generate_stream(
@@ -746,6 +770,22 @@ class QAService:
         if mi.knowledge_base_docs:
             lines.append(f"\n**相关文档**：{', '.join(mi.knowledge_base_docs)}")
         return "\n".join(lines) + "\n\n"
+
+    def _empty_retrieval_response(self, intent_primary: str) -> dict:
+        """检索结果为空时拒绝调用 LLM，直接返回安全话术"""
+        return {
+            "answer": (
+                "抱歉，当前知识库中暂无相关信息，无法为您提供准确回答。\n\n"
+                "建议您：\n"
+                "1. 联系海康技术支持获取专业指导\n"
+                "2. 在官网提交工单获取一对一服务"
+            ),
+            "confidence": 0.0,
+            "disposition": "refuse",
+            "intent": {"primary": intent_primary},
+            "citations": [],
+            "retrieval_count": 0,
+        }
 
     def _clarify_response(self, question: str) -> dict:
             return {
