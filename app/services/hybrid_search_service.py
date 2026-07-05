@@ -55,18 +55,25 @@ class HybridSearchService:
                 )
                 if r.scalar_one_or_none() is None:
                     model_number = None
-        #向量检索
-        query_embedding=EmbeddingService.embed_single(query)
-        milvus=get_milvus_client()
-        vector_hits=milvus.search(
-            collection_name=COLLECTION_NAME,
-            data=[query_embedding],
-            limit=top_k,
-            output_fields=["chunk_id","content","document_id","parent_title","product_series","doc_version"]
-        )
+        import asyncio
 
-        #关键词检索（MySQL LIKE + 型号精确匹配）
-        keyword_hits=await self._keyword_search(query,model_number,top_k)
+        milvus=get_milvus_client()
+
+        # 向量检索 + 关键词检索并行执行
+        async def _vector_search():
+            query_embedding = await asyncio.to_thread(EmbeddingService.embed_single, query)
+            return await asyncio.to_thread(
+                milvus.search,
+                collection_name=COLLECTION_NAME,
+                data=[query_embedding],
+                limit=top_k,
+                output_fields=["chunk_id","content","document_id","parent_title","product_series","doc_version"],
+            )
+
+        vector_hits, keyword_hits = await asyncio.gather(
+            _vector_search(),
+            self._keyword_search(query, model_number, top_k),
+        )
 
         #RRF融合
         doc_chunks:dict[int,dict]={}    # chunk_id -> chunk info
