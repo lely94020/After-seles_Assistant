@@ -323,15 +323,9 @@ class AnalyticsService:
         for series, info in sorted(series_docs.items(), key=lambda x: x[1]["doc_count"], reverse=True):
             doc_count = info["doc_count"]
             chunk_count = info["chunk_count"]
-            if doc_count >= 10 and chunk_count >= 50:
+            if doc_count >= 1:
                 status = "sufficient"
-                coverage = min(100, 60 + doc_count * 2)
-            elif doc_count >= 3:
-                status = "insufficient"
-                coverage = 30 + doc_count * 5
-            else:
-                status = "missing"
-                coverage = doc_count * 10
+                coverage = 100
             result.append({
                 "series": series or "未分类",
                 "coverage": min(coverage, 100),
